@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultralytics-striped"
+version = "0.1.0"
+description = "Pure PyTorch YOLO11 (no Ultralytics runtime dependency)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "pillow",
+]
+
+[project.scripts]
+yolo11-infer = "infer:main"
+yolo11-convert-pt = "model.convert_ultralytics_weights:main"
+
+[tool.setuptools]
+py-modules = ["infer"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model*"]

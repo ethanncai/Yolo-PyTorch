@@ -1,0 +1,6 @@
+# Runtime dependencies (aligned with pyproject.toml). Python >= 3.10.
+# CPU 默认：pip install -r requirements.txt
+# CUDA 请看 https://pytorch.org/get-started/locally/ 选择带 cuda 的 torch 轮子
+torch>=2.0
+numpy>=1.24
+pillow>=10.0
