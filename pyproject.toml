@@ -11,15 +11,17 @@ dependencies = [
     "torch",
     "numpy",
     "pillow",
+    "opencv-python-headless>=4.8",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
 yolo11-infer = "infer:main"
-yolo11-convert-pt = "model.convert_ultralytics_weights:main"
+yolo11-convert-pt = "scripts.convert_ultralytics_weights:main"
 
 [tool.setuptools]
-py-modules = ["infer"]
+py-modules = ["infer", "train"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["model*"]
+include = ["model*", "scripts*", "dataloader*", "utils*"]

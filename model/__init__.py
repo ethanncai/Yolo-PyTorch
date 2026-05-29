@@ -17,7 +17,7 @@ YOLO11 检测：显式 ``ModuleList`` + ``forward``，标准 ``.ckpt`` / 旧 ``.
 
 权重转换（.pt → ``assets/ckpts/*.ckpt``）::
 
-    python -m model.convert_ultralytics_weights assets/ckpts/yolo11n.pt
+    python scripts/convert_ultralytics_weights.py assets/ckpts/yolo11n.pt
     # 或: yolo11-convert-pt assets/ckpts/yolo11n.pt
 
 推理可视化（仅仓库根目录 ``infer.py``）::
