@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from .augment import Compose, Format, LetterBox, v8_transforms
 from .base import BaseDataset
@@ -35,6 +36,8 @@ class YOLODataset(BaseDataset):
         nm = nf = ne = nc = 0
         msgs: list[str] = []
         num_cls = len(self.data["names"])
+        n = len(self.im_files)
+        desc = f"{self.prefix.rstrip()}: scan"
         with ThreadPool(NUM_THREADS) as pool:
             results = pool.imap(
                 verify_image_label,
@@ -46,7 +49,9 @@ class YOLODataset(BaseDataset):
                     repeat(self.single_cls),
                 ),
             )
-            for im_file, lb, shape, _segments, nm_f, nf_f, ne_f, nc_f, msg in results:
+            for im_file, lb, shape, _segments, nm_f, nf_f, ne_f, nc_f, msg in tqdm(
+                results, total=n, desc=desc, unit="img"
+            ):
                 nm += nm_f
                 nf += nf_f
                 ne += ne_f
@@ -71,6 +76,7 @@ class YOLODataset(BaseDataset):
         x["results"] = (nf, nm, ne, nc, len(self.im_files))
         x["msgs"] = msgs
         if x["labels"]:
+            print(f"{self.prefix}Saving cache -> {path}")
             save_dataset_cache(path, x, DATASET_CACHE_VERSION)
         return x
 
@@ -83,7 +89,7 @@ class YOLODataset(BaseDataset):
             assert cache["hash"] == get_hash(self.label_files + self.im_files)
             print(f"{self.prefix}Loaded cache {cache_path}")
         except (FileNotFoundError, AssertionError, KeyError):
-            print(f"{self.prefix}Scanning labels…")
+            print(f"{self.prefix}Scanning {len(self.im_files)} labels (cache miss: {cache_path})")
             cache = self.cache_labels(cache_path)
 
         nf, nm, ne, nc, n = cache.pop("results")

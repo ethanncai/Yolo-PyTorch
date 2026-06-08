@@ -1,8 +1,11 @@
 # Runtime dependencies (aligned with pyproject.toml). Python >= 3.10.
 # CPU 默认：pip install -r requirements.txt
 # CUDA 请看 https://pytorch.org/get-started/locally/ 选择带 cuda 的 torch 轮子
+# Tesla V100 (CC 7.0) 需用仍含 sm_70 的 torch，例如：
+#   uv pip install "torch==2.5.1" --index-url https://download.pytorch.org/whl/cu124
 torch>=2.0
 numpy>=1.24
 pillow>=10.0
 opencv-python-headless>=4.8
 pyyaml>=6.0
+tqdm>=4.66

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["make_anchors", "dist2bbox"]
+__all__ = ["make_anchors", "dist2bbox", "bbox2dist"]
 
 
 def make_anchors(feats: list[torch.Tensor], strides: torch.Tensor, grid_cell_offset: float = 0.5):
@@ -33,3 +33,11 @@ def dist2bbox(distance: torch.Tensor, anchor_points: torch.Tensor, xywh: bool = 
         wh = x2y2 - x1y1
         return torch.cat([c_xy, wh], dim)
     return torch.cat((x1y1, x2y2), dim)
+
+
+def bbox2dist(anchor_points: torch.Tensor, bbox: torch.Tensor, reg_max: int | None = None) -> torch.Tensor:
+    x1y1, x2y2 = bbox.chunk(2, -1)
+    dist = torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1)
+    if reg_max is not None:
+        dist = dist.clamp_(0, reg_max - 0.01)
+    return dist

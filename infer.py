@@ -19,16 +19,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model import (
-    YOLO11L,
-    YOLO11M,
-    YOLO11N,
-    YOLO11S,
-    YOLO11X,
-    load_yolo11_checkpoint,
-)
+from model import YOLO11L, YOLO11M, YOLO11N, YOLO11S, YOLO11X
 from model.paths import ckpt_assets_dir
 from model.utils import guess_scale_from_name
+from model.weights import load_checkpoint_file, load_yolo11_checkpoint
 
 _SCALE_CLS = {"n": YOLO11N, "s": YOLO11S, "m": YOLO11M, "l": YOLO11L, "x": YOLO11X}
 
@@ -117,16 +111,18 @@ COCO_NAMES = (
 )
 
 
-def _read_ckpt_meta(path: Path) -> tuple[str, int]:
-    ck = torch.load(path, map_location="cpu", weights_only=False)
+def _read_ckpt_meta(path: Path) -> tuple[str, int, tuple[str, ...] | None]:
+    ck = load_checkpoint_file(path, device="cpu")
     if not isinstance(ck, dict):
-        return "", 80
+        return "", 80, None
     meta = ck.get("meta") or {}
     scale = str(meta.get("scale", "") or "").lower()
     if not scale:
         scale = guess_scale_from_name(path)
     nc = int(meta.get("nc", 80))
-    return scale, nc
+    names = meta.get("names")
+    names = tuple(str(n) for n in names) if names else None
+    return scale, nc, names
 
 
 def _build_model(ckpt_path: Path, scale: str, nc: int) -> torch.nn.Module:
@@ -275,6 +271,7 @@ def run_infer(
     iou_thres: float,
     max_det: int,
     max_nms_candidates: int,
+    names: tuple[str, ...] | None = None,
 ) -> tuple["Image.Image", int]:
     from PIL import Image
 
@@ -316,7 +313,8 @@ def run_infer(
 
     bx, sc, cl = multiclass_nms(boxes_xyxy, conf, cls_id, iou_thres, max_det)
     nc = int(model.nc) if hasattr(model, "nc") else cls_scores.shape[-1]
-    names = COCO_NAMES[:nc] if nc <= len(COCO_NAMES) else tuple(f"c{i}" for i in range(nc))
+    if names is None:
+        names = COCO_NAMES[:nc] if nc <= len(COCO_NAMES) else tuple(f"c{i}" for i in range(nc))
     img_full = torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0).permute(2, 0, 1)
     vis = draw_detections(img_full, bx.cpu(), sc.cpu(), cl.cpu(), names)
     return vis, int(bx.shape[0])
@@ -348,7 +346,7 @@ def main() -> None:
     if not img_path.is_file():
         raise SystemExit(f"找不到图片: {img_path}")
 
-    scale, nc = _read_ckpt_meta(ckpt_path)
+    scale, nc, names = _read_ckpt_meta(ckpt_path)
     model = _build_model(ckpt_path, scale, nc)
     dev = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = model.to(dev)
@@ -368,6 +366,7 @@ def main() -> None:
         iou_thres=args.iou,
         max_det=args.max_det,
         max_nms_candidates=3000,
+        names=names,
     )
     vis.save(out_path)
     print(f"saved {out_path} ({n} detections)")

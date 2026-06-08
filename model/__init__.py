@@ -34,6 +34,8 @@ from .utils import guess_scale_from_name, initialize_weights, make_divisible
 from .weights import (
     CKPT_FORMAT_VERSION,
     export_ultralytics_pt_to_ckpt,
+    load_checkpoint_file,
+    load_pretrained_checkpoint,
     load_yolo11_checkpoint,
     save_yolo11_ckpt,
 )
@@ -48,6 +50,8 @@ __all__ = [
     "YOLO11_SCALES",
     "Detect",
     "load_yolo11_checkpoint",
+    "load_pretrained_checkpoint",
+    "load_checkpoint_file",
     "save_yolo11_ckpt",
     "export_ultralytics_pt_to_ckpt",
     "CKPT_FORMAT_VERSION",

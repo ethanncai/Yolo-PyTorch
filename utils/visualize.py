@@ -31,7 +31,8 @@ def _draw_sample(
     arr = img.detach().cpu().numpy()
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
-    arr = arr.transpose(1, 2, 0)[:, :, ::-1]  # CHW BGR-ish -> RGB for PIL
+    # Format 变换输出 CHW RGB（cv2 读入 BGR 后已在 dataloader 中 swap）
+    arr = arr.transpose(1, 2, 0)
     h, w = arr.shape[:2]
     pil = Image.fromarray(arr)
     draw = ImageDraw.Draw(pil)

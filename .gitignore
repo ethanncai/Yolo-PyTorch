@@ -50,6 +50,12 @@ Thumbs.db
 # Project: downloaded Ultralytics weights cache (regenerate with convert script)
 .cache_ultra_pt/
 
+# Project: generated training / inference outputs
+runs/
+/out*.jpg
+/out*.png
+/out*.jpeg
+
 # Optional: large checkpoints / sources if you don’t commit them (uncomment if needed)
 assets/ckpts/*.ckpt
 assets/ckpts/*.pt
