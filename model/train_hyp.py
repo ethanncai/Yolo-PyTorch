@@ -10,6 +10,9 @@ class ModelHyp:
     box: float = 7.5
     cls: float = 0.5
     dfl: float = 1.5
+    assoc: float = 0.1
+    face_cls: int = 0
+    person_cls: int = 1
     lr0: float = 0.01
     lrf: float = 0.01
     momentum: float = 0.937

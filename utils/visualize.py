@@ -25,9 +25,13 @@ def _draw_sample(
     cls: torch.Tensor,
     names: list[str],
     *,
+    person_ids: torch.Tensor | None = None,
     max_boxes: int = 100,
 ) -> Image.Image:
-    """img: (3,H,W) uint8/float; bboxes: (N,4) normalized xywh."""
+    """img: (3,H,W) uint8/float; bboxes: (N,4) normalized xywh。
+
+    若提供 person_ids：同一个 person 同色 + 标 pid，pid<0（不属于任何人）用灰色。
+    """
     arr = img.detach().cpu().numpy()
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
@@ -49,9 +53,15 @@ def _draw_sample(
         x2 = (cx + bw / 2) * w
         y2 = (cy + bh / 2) * h
         cid = int(cls[i].item()) if cls.ndim else int(cls[i])
-        color = _color(cid)
+        name = names[cid] if cid < len(names) else str(cid)
+        if person_ids is not None:
+            pid = int(person_ids[i].item()) if person_ids.ndim else int(person_ids[i])
+            color = _color(pid) if pid >= 0 else (128, 128, 128)
+            label = f"{name} pid={pid}" if pid >= 0 else name
+        else:
+            color = _color(cid)
+            label = name
         draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-        label = names[cid] if cid < len(names) else str(cid)
         draw.text((x1, max(0, y1 - 14)), label, fill=color, font=font)
     return pil
 
@@ -70,6 +80,7 @@ def plot_training_batch(
     imgs = batch["img"]
     bboxes = batch["bboxes"]
     cls = batch["cls"]
+    person_id = batch.get("person_id")
     batch_idx = batch.get("batch_idx")
     if batch_idx is None:
         raise ValueError("batch 缺少 batch_idx，请使用 YOLODataset.collate_fn")
@@ -78,8 +89,9 @@ def plot_training_batch(
     b = min(imgs.shape[0], max_images)
     for i in range(b):
         mask = batch_idx == i
+        pid = person_id[mask] if person_id is not None else None
         tiles.append(
-            _draw_sample(imgs[i], bboxes[mask], cls[mask], names)
+            _draw_sample(imgs[i], bboxes[mask], cls[mask], names, person_ids=pid)
         )
 
     if not tiles:

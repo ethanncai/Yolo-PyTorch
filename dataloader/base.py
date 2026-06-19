@@ -94,6 +94,8 @@ class BaseDataset(Dataset):
             j = (lb["cls"] == inc).any(1)
             lb["cls"] = lb["cls"][j]
             lb["bboxes"] = lb["bboxes"][j]
+            if "person_id" in lb:
+                lb["person_id"] = lb["person_id"][j]
             if self.single_cls:
                 lb["cls"][:, 0] = 0
 
@@ -148,4 +150,5 @@ class BaseDataset(Dataset):
         hyp.mosaic = 0.0
         hyp.mixup = 0.0
         hyp.cutmix = 0.0
+        hyp.overlap_paste = 0.0
         self.transforms = self.build_transforms(hyp)

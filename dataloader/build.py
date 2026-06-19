@@ -98,14 +98,14 @@ def build_dataloader(
 
 
 def build_train_val_loaders(
-    data_yaml: str | dict,
+    data_yaml: str | list[str] | dict,
     *,
     imgsz: int = 640,
     batch: int = 16,
     workers: int = 8,
     hyp: TrainHyp | None = None,
 ) -> tuple[InfiniteDataLoader, DataLoader, dict]:
-    data = load_data_yaml(data_yaml) if isinstance(data_yaml, (str, os.PathLike)) else data_yaml
+    data = data_yaml if isinstance(data_yaml, dict) else load_data_yaml(data_yaml)
     hyp = hyp or TrainHyp(imgsz=imgsz)
     train_ds = build_yolo_dataset(
         data["train"], data, imgsz=imgsz, batch_size=batch, augment=True, hyp=hyp, prefix="train: "

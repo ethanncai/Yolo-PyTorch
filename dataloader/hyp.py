@@ -21,6 +21,7 @@ class TrainHyp:
     mosaic: float = 1.0
     mixup: float = 0.0
     cutmix: float = 0.0
+    overlap_paste: float = 0.0
     close_mosaic: int = 10
     bgr: float = 0.0
     mask_ratio: int = 4

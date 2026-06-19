@@ -18,10 +18,11 @@ dependencies = [
 
 [project.scripts]
 yolo11-infer = "infer:main"
+yolo11-infer-video = "infer_video:main"
 yolo11-convert-pt = "scripts.convert_ultralytics_weights:main"
 
 [tool.setuptools]
-py-modules = ["infer", "train"]
+py-modules = ["infer", "infer_video", "train"]
 
 [tool.setuptools.packages.find]
 where = ["."]

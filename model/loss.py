@@ -12,7 +12,7 @@ from .geom import bbox2dist, dist2bbox, make_anchors
 from .ops import xywh2xyxy
 from .tal import TaskAlignedAssigner
 
-__all__ = ["DFLoss", "BboxLoss", "v8DetectionLoss"]
+__all__ = ["DFLoss", "BboxLoss", "AssociationLoss", "v8DetectionLoss"]
 
 
 class DFLoss(nn.Module):
@@ -73,6 +73,70 @@ class BboxLoss(nn.Module):
         return loss_iou, loss_dfl
 
 
+class AssociationLoss(nn.Module):
+    def __init__(self, face_cls: int = 0, person_cls: int = 1) -> None:
+        super().__init__()
+        self.face_cls = face_cls
+        self.person_cls = person_cls
+
+    def forward(
+        self,
+        pred_embeds: torch.Tensor,
+        fg_mask: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        target_person_ids: torch.Tensor,
+        target_labels: torch.Tensor,
+        gt_bboxes: torch.Tensor,
+        pair_scorer: nn.Module,
+    ) -> torch.Tensor:
+        loss_terms = []
+        batch_size = pred_embeds.shape[0]
+        for bi in range(batch_size):
+            mask = fg_mask[bi]
+            if not mask.any():
+                continue
+            emb = F.normalize(pred_embeds[bi, mask], dim=-1)
+            gt_idx = target_gt_idx[bi, mask]
+            obj_embeds, obj_boxes = [], []
+            obj_labels: list[int] = []
+            obj_pids: list[int] = []
+            for gi in gt_idx.unique():
+                gi_long = gi.long()
+                pid = int(target_person_ids[bi, gi_long])
+                if pid < 0:
+                    continue
+                label = int(target_labels[bi, gi_long])
+                if label not in {self.face_cls, self.person_cls}:
+                    continue
+                obj_embeds.append(F.normalize(emb[gt_idx == gi].mean(0), dim=0))
+                obj_boxes.append(gt_bboxes[bi, gi_long])
+                obj_labels.append(label)
+                obj_pids.append(pid)
+
+            if len(obj_embeds) < 2:
+                continue
+
+            obj = torch.stack(obj_embeds)
+            boxes = torch.stack(obj_boxes).to(obj.device)
+            labels = torch.tensor(obj_labels, device=obj.device)
+            pids = torch.tensor(obj_pids, device=obj.device)
+            face_mask = labels == self.face_cls
+            person_mask = labels == self.person_cls
+            if not face_mask.any() or not person_mask.any():
+                continue
+            logits = pair_scorer(
+                obj[face_mask],
+                obj[person_mask],
+                boxes[face_mask],
+                boxes[person_mask],
+            )
+            targets = (pids[face_mask, None] == pids[None, person_mask]).to(logits.dtype)
+            loss_terms.append(F.binary_cross_entropy_with_logits(logits, targets))
+        if not loss_terms:
+            return pred_embeds.sum() * 0.0
+        return torch.stack(loss_terms).mean()
+
+
 class v8DetectionLoss:
     def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
         device = next(model.parameters()).device
@@ -95,6 +159,11 @@ class v8DetectionLoss:
             topk2=tal_topk2,
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.detect_head = m
+        self.assoc_loss = AssociationLoss(
+            face_cls=int(getattr(h, "face_cls", 0)),
+            person_cls=int(getattr(h, "person_cls", 1)),
+        ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -120,16 +189,21 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]):
-        loss = torch.zeros(3, device=self.device)
+        loss = torch.zeros(4, device=self.device)
         pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()
         pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
+        pred_embeds = preds.get("embeds")
+        pred_embeds = pred_embeds.permute(0, 2, 1).contiguous() if pred_embeds is not None else None
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        person_id = batch.get("person_id")
+        if person_id is None:
+            person_id = torch.full_like(batch["cls"].view(-1, 1), -1.0)
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"], person_id.view(-1, 1)), 1)
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        gt_labels, gt_bboxes, gt_person_ids = targets.split((1, 4, 1), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
@@ -154,9 +228,20 @@ class v8DetectionLoss:
                 imgsz,
                 stride_tensor,
             )
+            if pred_embeds is not None and (gt_person_ids >= 0).any():
+                loss[3] = self.assoc_loss(
+                    pred_embeds,
+                    fg_mask,
+                    target_gt_idx,
+                    gt_person_ids.squeeze(-1).long(),
+                    gt_labels.squeeze(-1).long(),
+                    gt_bboxes,
+                    self.detect_head.pair_logits,
+                )
         loss[0] *= self.hyp.box
         loss[1] *= self.hyp.cls
         loss[2] *= self.hyp.dfl
+        loss[3] *= getattr(self.hyp, "assoc", 0.1)
         return (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), loss, loss.detach()
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:

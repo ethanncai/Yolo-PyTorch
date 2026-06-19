@@ -52,10 +52,23 @@ Thumbs.db
 
 # Project: generated training / inference outputs
 runs/
+outputs/
+logs/
+tmp/
 /out*.jpg
 /out*.png
 /out*.jpeg
+/out*.mp4
+/tracked*.mp4
+/hard*.mp4
+/mideum*.mp4
+/test*.jpg
+/test*.png
+/test.det.png/
 
-# Optional: large checkpoints / sources if you don’t commit them (uncomment if needed)
-assets/ckpts/*.ckpt
-assets/ckpts/*.pt
+# Project: keep release/demo model weights in Git.
+# GitHub rejects files over 100 MB; current assets/ckpts weights are below that.
+!assets/ckpts/
+!assets/ckpts/*.ckpt
+!assets/ckpts/*.pt
+!assets/ckpts/*.pth

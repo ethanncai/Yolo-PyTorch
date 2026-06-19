@@ -18,7 +18,7 @@ IMG_FORMATS = {
     "bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp",
     "heic", "heif", "avif", "jp2", "jpeg2000",
 }
-DATASET_CACHE_VERSION = "1.0.3"
+DATASET_CACHE_VERSION = "1.1.0"
 NUM_THREADS = min(8, os.cpu_count() or 1)
 
 
@@ -79,11 +79,16 @@ def verify_image_label(args: tuple) -> tuple:
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)
+                else:
+                    widths = {len(x) for x in lb}
+                    assert widths.issubset({5, 6}), f"labels require 5 or 6 columns, got {sorted(widths)}"
+                    if len(widths) > 1:
+                        lb = [x + ["-1"] if len(x) == 5 else x for x in lb]
                 lb = np.array(lb, dtype=np.float32)
             if nl := len(lb):
-                assert lb.shape[1] == 5, f"labels require 5 columns, got {lb.shape[1]}"
-                assert lb[:, 1:].max() <= 1.01, "non-normalized coordinates"
-                assert lb.min() >= -0.01, "negative labels"
+                assert lb.shape[1] in {5, 6}, f"labels require 5 or 6 columns, got {lb.shape[1]}"
+                assert lb[:, 1:5].max() <= 1.01, "non-normalized coordinates"
+                assert lb[:, :5].min() >= -0.01, "negative labels"
                 max_cls = 0 if single_cls else lb[:, 0].max()
                 assert max_cls < num_cls, f"class {int(max_cls)} >= nc {num_cls}"
                 _, i = np.unique(lb, axis=0, return_index=True)
@@ -123,8 +128,49 @@ def save_dataset_cache(path: Path, data: dict, version: str) -> None:
         np.save(f, data)
 
 
-def load_data_yaml(path: str | Path) -> dict[str, Any]:
-    """解析 YOLO 数据配置（标准 COCO/YOLO 目录 + data.yaml）。"""
+def _listify(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def _merge_data_yamls(datasets: list[dict[str, Any]]) -> dict[str, Any]:
+    if not datasets:
+        raise ValueError("no data yaml provided")
+
+    names = list(datasets[0]["names"])
+    channels = datasets[0].get("channels", 3)
+    for data in datasets[1:]:
+        if list(data["names"]) != names:
+            raise SyntaxError(
+                "multiple data.yaml files must use the same class names and order: "
+                f"{datasets[0]['yaml_file']} != {data['yaml_file']}"
+            )
+        if data.get("channels", 3) != channels:
+            raise SyntaxError(
+                "multiple data.yaml files must use the same channel count: "
+                f"{datasets[0]['yaml_file']} != {data['yaml_file']}"
+            )
+
+    merged = dict(datasets[0])
+    merged["yaml_file"] = [data["yaml_file"] for data in datasets]
+    merged["path"] = [data["path"] for data in datasets]
+    merged["names"] = names
+    merged["nc"] = len(names)
+    merged["channels"] = channels
+    for k in ("train", "val", "test"):
+        paths: list[str] = []
+        for data in datasets:
+            if data.get(k):
+                paths.extend(_listify(data[k]))
+        if paths:
+            merged[k] = paths
+    return merged
+
+
+def load_data_yaml(path: str | Path | list[str | Path] | tuple[str | Path, ...]) -> dict[str, Any]:
+    """解析 YOLO 数据配置（标准 COCO/YOLO 目录 + data.yaml），支持多个 data.yaml 合并。"""
+    if isinstance(path, (list, tuple)):
+        return _merge_data_yamls([load_data_yaml(p) for p in path])
+
     file = Path(path).expanduser().resolve()
     if file.is_dir():
         candidates = list(file.glob("*.yaml")) + list(file.glob("*.yml"))

@@ -62,7 +62,8 @@ class YOLODataset(BaseDataset):
                             "im_file": im_file,
                             "shape": shape,
                             "cls": lb[:, 0:1],
-                            "bboxes": lb[:, 1:],
+                            "bboxes": lb[:, 1:5],
+                            "person_id": lb[:, 5:6] if lb.shape[1] > 5 else np.full((len(lb), 1), -1, dtype=np.float32),
                             "segments": [],
                             "normalized": True,
                             "bbox_format": "xywh",
@@ -125,6 +126,7 @@ class YOLODataset(BaseDataset):
         label.pop("segments", None)
         label["instances"] = Instances(bboxes, bbox_format=bbox_format, normalized=normalized)
         label["cls"] = label.pop("cls")
+        label["person_id"] = label.pop("person_id", np.full((len(bboxes), 1), -1, dtype=np.float32))
         return label
 
     @staticmethod
@@ -137,7 +139,7 @@ class YOLODataset(BaseDataset):
             value = values[i]
             if k == "img":
                 value = torch.stack(value, 0)
-            elif k in {"bboxes", "cls"}:
+            elif k in {"bboxes", "cls", "person_id"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         if "batch_idx" in new_batch:

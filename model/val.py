@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -123,7 +124,8 @@ def _compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
     mpre = np.concatenate(([1.0], precision, [0.0]))
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
     x = np.linspace(0, 1, 101)
-    return float(np.trapz(np.interp(x, mrec, mpre), x))
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    return float(trapz(np.interp(x, mrec, mpre), x))
 
 
 def _ap_per_class(
@@ -157,6 +159,65 @@ def _ap_per_class(
     return ap, seen
 
 
+_VIZ_PALETTE = (
+    (255, 56, 56), (56, 255, 56), (56, 56, 255), (255, 159, 56),
+    (56, 255, 255), (255, 56, 255), (255, 255, 56), (128, 128, 128),
+)
+
+
+def _save_val_viz(img: torch.Tensor, det: torch.Tensor, names, out_path: Path) -> None:
+    """img: (3,H,W) float 0..1（letterbox 空间）；det: (n,6) xyxy,conf,cls。"""
+    from PIL import Image, ImageDraw
+
+    arr = (img.clamp(0, 1) * 255).byte().cpu().permute(1, 2, 0).numpy()
+    im = Image.fromarray(arr, mode="RGB")
+    dr = ImageDraw.Draw(im)
+    for x1, y1, x2, y2, sc, ci in det.cpu().tolist():
+        ci = int(ci)
+        color = _VIZ_PALETTE[ci % len(_VIZ_PALETTE)]
+        name = names[ci] if names and 0 <= ci < len(names) else str(ci)
+        dr.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        dr.text((x1 + 2, max(0, y1 - 11)), f"{name} {sc:.2f}", fill=color)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    im.save(out_path)
+
+
+def _save_val_assoc_viz(
+    img: torch.Tensor,
+    pred: torch.Tensor,
+    embeds: "torch.Tensor | None",
+    names,
+    conf_thres: float,
+    iou_thres: float,
+    max_det: int,
+    out_path: Path,
+) -> None:
+    """画 association 分组：同一 person 同色，挂不上任何人的部位灰色。
+
+    pred: (anchors, 4+nc) xywh 像素 + sigmoid 分数；embeds: (anchors, dim) 或 None。
+    复用 infer.py 的聚类与绘制逻辑（letterbox 空间，框已是该尺度）。
+    """
+    from infer import assign_person_ids, draw_detections, multiclass_nms, xywh2xyxy
+
+    names_t = tuple(names) if names is not None else tuple(str(i) for i in range(int(pred.shape[1]) - 4))
+    boxes_xywh = pred[:, :4]
+    cls_scores = pred[:, 4:]
+    conf, cls_id = cls_scores.max(dim=1)
+    mask = conf >= conf_thres
+    if mask.sum() == 0:
+        _save_val_viz(img, pred.new_zeros((0, 6)), names, out_path)
+        return
+    boxes_xywh, conf, cls_id = boxes_xywh[mask], conf[mask], cls_id[mask]
+    emb = embeds[mask] if embeds is not None else None
+    boxes_xyxy = xywh2xyxy(boxes_xywh)
+    bx, sc, cl, keep_idx = multiclass_nms(boxes_xyxy, conf, cls_id, iou_thres, max_det)
+    kept_emb = emb[keep_idx] if emb is not None and keep_idx.numel() else None
+    person_ids = assign_person_ids(bx, sc, cl, kept_emb, names_t, assoc_thres=0.45)
+    vis = draw_detections(img, bx.cpu(), sc.cpu(), cl.cpu(), names_t, person_ids=person_ids, box_width=2)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vis.save(out_path)
+
+
 class DetValMetrics:
     def __init__(self, map50: float, map: float, ap_per_class: np.ndarray, seen: np.ndarray):
         self.map50 = map50
@@ -181,8 +242,19 @@ def validate(
     max_det: int = 300,
     amp: bool = False,
     progress_interval: int = 50,
+    viz_dir: "str | Path | None" = None,
+    viz_count: int = 8,
+    viz_conf: float = 0.25,
+    viz_iou: float = 0.45,
+    names: "list[str] | None" = None,
 ) -> DetValMetrics:
-    """在 val 集上评估，返回 mAP50 / mAP50-95。GT 与预测均在 letterbox 640 空间比较。"""
+    """在 val 集上评估，返回 mAP50 / mAP50-95。GT 与预测均在 letterbox 640 空间比较。
+
+    若提供 ``viz_dir``，则把前 ``viz_count`` 张验证图（含预测框）保存到该目录。
+    可视化用 ``viz_conf`` / ``viz_iou``（默认 0.25 / 0.45，与 infer 一致），与
+    mAP 评测用的 ``conf_thres`` / ``iou_thres``（0.001 / 0.7，COCO 标准）解耦，
+    保证可视化呈现的框与最终推理结果一致。
+    """
     was_training = model.training
     model.eval()
     iouv = torch.linspace(0.5, 0.95, 10, device=device)
@@ -190,6 +262,11 @@ def validate(
     stats_conf: list[np.ndarray] = []
     stats_pcls: list[np.ndarray] = []
     target_cls_all: list[np.ndarray] = []
+
+    viz_dir = Path(viz_dir) if viz_dir is not None else None
+    if viz_dir is not None:
+        viz_dir.mkdir(parents=True, exist_ok=True)
+    viz_saved = 0
 
     total_batches = len(val_loader)
     t0 = time.time()
@@ -202,6 +279,12 @@ def validate(
             out = model(imgs)
         preds = out[0] if isinstance(out, (tuple, list)) else out  # (bs, 4+nc, anchors)
         preds = preds.float()
+        raw_preds = out[1] if isinstance(out, (tuple, list)) and len(out) > 1 else None
+        embeds_bchw = None
+        if isinstance(raw_preds, dict):
+            assoc = raw_preds.get("one2one") if "one2one" in raw_preds else raw_preds
+            if isinstance(assoc, dict) and "embeds" in assoc:
+                embeds_bchw = assoc["embeds"].float()  # (bs, assoc_dim, anchors)
 
         batch_idx = batch["batch_idx"].to(device)
         gt_cls = batch["cls"].to(device).view(-1)
@@ -223,6 +306,20 @@ def validate(
             stats_tp.append(tp.cpu().numpy())
             stats_conf.append(det[:, 4].cpu().numpy())
             stats_pcls.append(det[:, 5].cpu().numpy())
+
+        if viz_dir is not None and viz_saved < viz_count:
+            for si in range(bs):
+                if viz_saved >= viz_count:
+                    break
+                pred = preds[si].transpose(0, 1)
+                det = _non_max_suppression(pred, viz_conf, viz_iou, max_det)
+                _save_val_viz(imgs[si], det, names, viz_dir / f"val_pred_{viz_saved:02d}.jpg")
+                emb_si = embeds_bchw[si].transpose(0, 1) if embeds_bchw is not None else None
+                _save_val_assoc_viz(
+                    imgs[si], pred, emb_si, names, viz_conf, viz_iou, max_det,
+                    viz_dir / f"val_assoc_{viz_saved:02d}.jpg",
+                )
+                viz_saved += 1
 
         if progress_interval > 0 and (bi % progress_interval == 0 or bi == total_batches):
             elapsed = time.time() - t0

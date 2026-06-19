@@ -11,6 +11,7 @@
 用法::
 
     python train.py --data coco.yaml --epochs 100 --batch 16 --scale n
+    python train.py --data dataset1.yaml dataset2.yaml --epochs 100 --batch 16 --scale n
     python train.py --data coco.yaml --weights yolo11n.pt --preview-only
 """
 
@@ -74,8 +75,14 @@ class ModelEMA:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO11 detection training")
-    p.add_argument("--data", type=str, required=True, help="data.yaml 路径")
+    p.add_argument("--data", type=str, nargs="+", required=True, help="一个或多个 data.yaml 路径")
     p.add_argument("--weights", "--weight", dest="weights", type=str, default="", help="预训练 .ckpt / .pt（可选）")
+    p.add_argument(
+        "--keep-names",
+        type=str,
+        default="face,person",
+        help="训练时保留并重映射的类别名，默认 face,person；传空字符串表示保留 data.yaml 全部类别",
+    )
     p.add_argument("--scale", type=str, default="n", choices=tuple(_SCALE_CLS))
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--batch", type=int, default=16)
@@ -86,9 +93,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--name", type=str, default="exp")
     p.add_argument("--mosaic", type=float, default=1.0)
     p.add_argument("--mixup", type=float, default=0.0)
+    p.add_argument("--overlap-paste", type=float, default=0.0, help="轻微重叠人物粘贴增强概率")
     p.add_argument("--close-mosaic", type=int, default=10)
     p.add_argument("--lr0", type=float, default=0.01)
     p.add_argument("--lrf", type=float, default=0.01)
+    p.add_argument("--assoc", type=float, default=0.1, help="association embedding loss 权重，0 表示关闭")
     p.add_argument("--save-period", type=int, default=10, help="每 N epoch 保存一次")
     p.add_argument("--fraction", type=float, default=1.0, help="训练集子集比例（调试用）")
     p.add_argument("--val-interval", type=int, default=1, help="每 N epoch 验证一次 mAP")
@@ -97,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-iou", type=float, default=0.7, help="验证 NMS IoU 阈值")
     p.add_argument("--val-max-det", type=int, default=300, help="验证每图最多检测框")
     p.add_argument("--val-fraction", type=float, default=1.0, help="验证集子集比例（大 val 集调试用）")
+    p.add_argument("--val-split", type=float, default=0.1,
+                   help="当 data.yaml 的 val 与 train 指向同一数据源时，自动切出的验证集比例")
     p.add_argument("--val-log-interval", type=int, default=5, help="验证每 N 个 batch 打印一次进度")
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--log-interval", type=int, default=1, help="每 N 个 batch 打印一次（默认 1=每 step）")
@@ -167,6 +178,100 @@ def batch_to_device(batch: dict, device: torch.device) -> dict:
     return out
 
 
+def _same_source(a, b) -> bool:
+    """判断 data.yaml 的 train / val 是否指向同一数据源（解析为绝对路径后比较）。"""
+    def norm(x):
+        items = x if isinstance(x, (list, tuple)) else [x]
+        return tuple(sorted(str(Path(p).resolve()) for p in items))
+    return norm(a) == norm(b)
+
+
+def _restrict_dataset(ds, keep_idx) -> None:
+    """原地把数据集裁剪为只保留 keep_idx 指定的样本，并重建相关缓存与 transforms。"""
+    keep_idx = list(keep_idx)
+    ds.im_files = [ds.im_files[i] for i in keep_idx]
+    ds.labels = [ds.labels[i] for i in keep_idx]
+    if getattr(ds, "label_files", None):
+        ds.label_files = [ds.label_files[i] for i in keep_idx]
+    ds.ni = len(ds.labels)
+    ds.ims = [None] * ds.ni
+    ds.im_hw0 = [None] * ds.ni
+    ds.im_hw = [None] * ds.ni
+    ds.buffer = []
+    ds.max_buffer_length = min(ds.ni, ds.batch_size * 8, 1000) if ds.augment else 0
+    ds.transforms = ds.build_transforms(ds.hyp)
+
+
+def _parse_keep_names(value: str, names: list[str]) -> list[str]:
+    keep = [x.strip() for x in value.split(",") if x.strip()]
+    if not keep:
+        return list(names)
+    name_to_idx = {name: i for i, name in enumerate(names)}
+    missing = [name for name in keep if name not in name_to_idx]
+    if missing:
+        raise ValueError(f"--keep-names contains names not in data.yaml: {missing}; available={names}")
+    return keep
+
+
+def _filter_dataset_classes(ds, src_names: list[str], keep_names: list[str]) -> None:
+    if keep_names == src_names:
+        ds.data["names"] = list(keep_names)
+        ds.data["nc"] = len(keep_names)
+        return
+    keep_old = {src_names.index(name): new_idx for new_idx, name in enumerate(keep_names)}
+    for lb in ds.labels:
+        cls = lb["cls"].reshape(-1).astype(np.int64)
+        keep_mask = np.array([int(c) in keep_old for c in cls], dtype=bool)
+        lb["cls"] = np.array([keep_old[int(c)] for c in cls[keep_mask]], dtype=np.float32).reshape(-1, 1)
+        lb["bboxes"] = lb["bboxes"][keep_mask]
+        if "person_id" in lb:
+            lb["person_id"] = lb["person_id"][keep_mask]
+    ds.data["names"] = list(keep_names)
+    ds.data["nc"] = len(keep_names)
+    ds.transforms = ds.build_transforms(ds.hyp)
+
+
+def _apply_face_person_pipeline(data: dict, datasets: list, keep_names: list[str]) -> None:
+    src_names = list(data["names"])
+    for ds in datasets:
+        _filter_dataset_classes(ds, src_names, keep_names)
+    data["source_names"] = src_names
+    data["names"] = list(keep_names)
+    data["nc"] = len(keep_names)
+
+
+@torch.no_grad()
+def compute_val_assoc_loss(model, val_loader, criterion, device, amp) -> float:
+    """在 val 集上计算 association loss（越低越好）。
+
+    模型需处于 training 模式才会输出 one2many 字典供 criterion 使用，但这会让
+    BatchNorm 更新 running 统计量，因此这里显式把所有 BN 设为 eval 以冻结其统计量。
+    """
+    was_training = model.training
+    model.train()
+    bn_mods = [m for m in model.modules()
+               if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    bn_prev = [m.training for m in bn_mods]
+    for m in bn_mods:
+        m.eval()
+    total, n = 0.0, 0
+    for batch in val_loader:
+        batch = batch_to_device(batch, device)
+        imgs = batch["img"].float() / 255.0
+        with autocast(enabled=amp and device.type == "cuda"):
+            preds = model(imgs)
+            if isinstance(preds, dict) and "one2many" in preds:
+                preds = preds["one2many"]
+            _, loss_items = criterion(preds, batch)
+        total += float(loss_items[3])
+        n += 1
+    for m, st in zip(bn_mods, bn_prev):
+        m.train(st)
+    if not was_training:
+        model.eval()
+    return total / max(n, 1)
+
+
 def log_train_step(
     epoch: int,
     total_epochs: int,
@@ -180,7 +285,8 @@ def log_train_step(
     total = loss_items.sum().item()
     print(
         f"[epoch {epoch + 1}/{total_epochs}] step {step}/{total_steps}  "
-        f"box={loss_items[0].item():.4f} cls={loss_items[1].item():.4f} dfl={loss_items[2].item():.4f}  "
+        f"box={loss_items[0].item():.4f} cls={loss_items[1].item():.4f} "
+        f"dfl={loss_items[2].item():.4f} assoc={loss_items[3].item():.4f}  "
         f"loss={total:.4f}  elapsed={elapsed:.0f}s eta={eta:.0f}s",
         flush=True,
     )
@@ -206,11 +312,15 @@ def main() -> None:
         imgsz=args.imgsz,
         mosaic=args.mosaic,
         mixup=args.mixup,
+        overlap_paste=args.overlap_paste,
         close_mosaic=args.close_mosaic,
     )
-    hyp = ModelHyp(lr0=args.lr0, lrf=args.lrf)
+    hyp = ModelHyp(lr0=args.lr0, lrf=args.lrf, assoc=args.assoc)
 
     data = load_data_yaml(args.data)
+    source_names = list(data["names"])
+    keep_names = _parse_keep_names(args.keep_names, source_names)
+    auto_split = _same_source(data["train"], data["val"])
     train_ds = build_yolo_dataset(
         data["train"],
         data,
@@ -221,19 +331,44 @@ def main() -> None:
         prefix="train: ",
         fraction=args.fraction,
     )
-    val_ds = build_yolo_dataset(
-        data["val"],
-        data,
-        imgsz=args.imgsz,
-        batch_size=args.batch,
-        augment=False,
-        hyp=hyp_aug,
-        prefix="val: ",
-        fraction=args.val_fraction,
-    )
+    if auto_split:
+        _apply_face_person_pipeline(data, [train_ds], keep_names)
+        print(
+            f"[auto-split] data.yaml 的 train 与 val 指向同一数据源，"
+            f"自动按 val-split={args.val_split} 切分验证集 (seed=0)"
+        )
+        val_ds = deepcopy(train_ds)
+        val_ds.augment = False
+        val_ds.prefix = "val: "
+        n = len(train_ds.labels)
+        perm = np.random.default_rng(0).permutation(n)
+        n_val = max(1, int(round(n * args.val_split)))
+        val_idx = sorted(int(i) for i in perm[:n_val])
+        train_idx = sorted(int(i) for i in perm[n_val:])
+        if args.val_fraction < 1.0:
+            val_idx = val_idx[: max(1, round(len(val_idx) * args.val_fraction))]
+        _restrict_dataset(train_ds, train_idx)
+        _restrict_dataset(val_ds, val_idx)
+    else:
+        val_ds = build_yolo_dataset(
+            data["val"],
+            data,
+            imgsz=args.imgsz,
+            batch_size=args.batch,
+            augment=False,
+            hyp=hyp_aug,
+            prefix="val: ",
+            fraction=args.val_fraction,
+        )
+        _apply_face_person_pipeline(data, [train_ds, val_ds], keep_names)
     train_loader = build_dataloader(train_ds, args.batch, args.workers, shuffle=True, infinite=True)
     val_loader = build_dataloader(val_ds, args.batch, args.workers, shuffle=False, infinite=False)
     names: list[str] = list(data["names"])
+    lower_names = [name.lower() for name in names]
+    if "face" not in lower_names or "person" not in lower_names:
+        raise ValueError(f"face-person association requires names containing face and person, got {names}")
+    hyp.face_cls = lower_names.index("face")
+    hyp.person_cls = lower_names.index("person")
     out_dir = Path(args.project) / args.name
     sample_dir = out_dir / "samples"
     weights_dir = out_dir / "weights"
@@ -242,7 +377,10 @@ def main() -> None:
 
     print(f"train: {len(train_loader.dataset)} images")
     print(f"val:   {len(val_loader.dataset)} images")
+    if keep_names != source_names:
+        print(f"class filter/remap: {source_names} -> {names}")
     print(f"nc={data['nc']}  names={names}")
+    print(f"assoc pair classes: face={hyp.face_cls} person={hyp.person_cls}")
 
     n_preview = min(args.preview_batches, len(train_loader))
     train_iter = iter(train_loader)
@@ -271,6 +409,9 @@ def main() -> None:
     lf = one_cycle(1, hyp.lrf, args.epochs) if hyp.cos_lr else (lambda x: (1 - x / args.epochs) * (1.0 - hyp.lrf) + hyp.lrf)
     best_fitness = -1.0
     best_epoch = 0
+    best_assoc = float("inf")
+    best_assoc_epoch = 0
+    track_assoc = args.assoc > 0
 
     print(f"\nStart training: device={device} epochs={args.epochs} batch={args.batch} amp={scaler.is_enabled()}")
     print(f"  {nb} batches/epoch  (~{len(train_loader.dataset)} images)\n")
@@ -284,7 +425,7 @@ def main() -> None:
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_items_sum = torch.zeros(3, device=device)
+        loss_items_sum = torch.zeros(4, device=device)
         n_batches = 0
         train_iter = iter(train_loader)
         t_epoch = time.time()
@@ -321,7 +462,8 @@ def main() -> None:
         dt = time.time() - t0
         print(
             f"epoch {epoch + 1}/{args.epochs}  "
-            f"box={avg_items[0]:.4f} cls={avg_items[1]:.4f} dfl={avg_items[2]:.4f}  "
+            f"box={avg_items[0]:.4f} cls={avg_items[1]:.4f} "
+            f"dfl={avg_items[2]:.4f} assoc={avg_items[3]:.4f}  "
             f"loss={total:.4f}  time={dt:.1f}s"
         )
 
@@ -343,6 +485,10 @@ def main() -> None:
                 max_det=args.val_max_det,
                 amp=scaler.is_enabled(),
                 progress_interval=args.val_log_interval,
+                viz_dir=sample_dir / f"val_pred_epoch{epoch + 1}",
+                viz_count=8,
+                viz_conf=0.25,
+                names=names,
             )
             fitness = metrics.fitness
             print(
@@ -352,19 +498,48 @@ def main() -> None:
             if fitness > best_fitness:
                 best_fitness = fitness
                 best_epoch = epoch + 1
+                det_meta = {
+                    "epoch": epoch + 1,
+                    "names": names,
+                    "fitness": best_fitness,
+                    "map50": metrics.map50,
+                    "map": metrics.map,
+                }
                 save_yolo11_ckpt(
-                    ema.ema,
-                    weights_dir / "best.ckpt",
-                    meta={
-                        "epoch": epoch + 1,
-                        "names": names,
-                        "fitness": best_fitness,
-                        "map50": metrics.map50,
-                        "map": metrics.map,
-                    },
-                    scale=args.scale,
-                    nc=data["nc"],
+                    ema.ema, weights_dir / "best_det.ckpt",
+                    meta=det_meta, scale=args.scale, nc=data["nc"],
                 )
+                # 兼容旧脚本：best.ckpt == best_det.ckpt
+                save_yolo11_ckpt(
+                    ema.ema, weights_dir / "best.ckpt",
+                    meta=det_meta, scale=args.scale, nc=data["nc"],
+                )
+
+            if track_assoc:
+                val_assoc = compute_val_assoc_loss(
+                    ema.ema, val_loader, criterion, device, scaler.is_enabled()
+                )
+                best_so_far = best_assoc if best_assoc < float("inf") else 0.0
+                print(
+                    f"           val: assoc_loss={val_assoc:.4f} "
+                    f"(best={best_so_far:.4f}@ep{best_assoc_epoch})"
+                )
+                if val_assoc < best_assoc:
+                    best_assoc = val_assoc
+                    best_assoc_epoch = epoch + 1
+                    save_yolo11_ckpt(
+                        ema.ema,
+                        weights_dir / "best_assoc.ckpt",
+                        meta={
+                            "epoch": epoch + 1,
+                            "names": names,
+                            "assoc_loss": best_assoc,
+                            "map50": metrics.map50,
+                            "map": metrics.map,
+                        },
+                        scale=args.scale,
+                        nc=data["nc"],
+                    )
             if args.patience > 0 and (epoch + 1) - best_epoch >= args.patience:
                 print(
                     f"早停：mAP 连续 {args.patience} epoch 未提升（best fitness={best_fitness:.4f} @ epoch {best_epoch}）"
@@ -381,7 +556,9 @@ def main() -> None:
 
     print(f"\nTraining done. weights -> {weights_dir.resolve()}")
     if best_fitness >= 0:
-        print(f"best fitness={best_fitness:.4f} @ epoch {best_epoch}  ({weights_dir / 'best.ckpt'})")
+        print(f"best det   fitness={best_fitness:.4f} @ epoch {best_epoch}  ({weights_dir / 'best_det.ckpt'})")
+    if track_assoc and best_assoc < float("inf"):
+        print(f"best assoc loss={best_assoc:.4f} @ epoch {best_assoc_epoch}  ({weights_dir / 'best_assoc.ckpt'})")
 
 
 if __name__ == "__main__":

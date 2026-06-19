@@ -74,6 +74,22 @@ class BaseMixTransform(BaseTransform):
         return random.randint(0, len(self.dataset) - 1)
 
 
+def _person_ids(labels: dict[str, Any], indexes: np.ndarray | None = None) -> np.ndarray:
+    ids = labels.get("person_id", np.full((len(labels["cls"]), 1), -1, dtype=np.float32))
+    return ids.copy() if indexes is None else ids[indexes].copy()
+
+
+def concat_person_ids(labels1: dict[str, Any], labels2: dict[str, Any], indexes2: np.ndarray | None = None) -> np.ndarray:
+    ids1 = _person_ids(labels1)
+    ids2 = _person_ids(labels2, indexes2)
+    valid1 = ids1 >= 0
+    if valid1.any():
+        offset = int(ids1[valid1].max()) + 1
+        valid2 = ids2 >= 0
+        ids2[valid2] += offset
+    return np.concatenate([ids1, ids2], axis=0)
+
+
 class Mosaic(BaseMixTransform):
     def __init__(self, dataset, imgsz: int = 640, p: float = 1.0, n: int = 4):
         assert n in {4, 9}
@@ -156,18 +172,35 @@ class Mosaic(BaseMixTransform):
     def _cat_labels(self, mosaic_labels: list[dict]) -> dict:
         cls = [m["cls"] for m in mosaic_labels]
         instances = [m["instances"] for m in mosaic_labels]
+        person_id = self._cat_person_ids(mosaic_labels)
         imgsz = self.imgsz * 2
         final = {
             "im_file": mosaic_labels[0]["im_file"],
             "ori_shape": mosaic_labels[0]["ori_shape"],
             "resized_shape": (imgsz, imgsz),
             "cls": np.concatenate(cls, 0),
+            "person_id": person_id,
             "instances": Instances.concatenate(instances, axis=0),
         }
         final["instances"].clip(imgsz, imgsz)
         good = final["instances"].remove_zero_area_boxes()
         final["cls"] = final["cls"][good]
+        final["person_id"] = final["person_id"][good]
         return final
+
+    @staticmethod
+    def _cat_person_ids(labels_list: list[dict]) -> np.ndarray:
+        ids_list = []
+        offset = 0
+        for labels in labels_list:
+            n = len(labels["cls"])
+            ids = labels.get("person_id", np.full((n, 1), -1, dtype=np.float32)).copy()
+            valid = ids >= 0
+            if valid.any():
+                ids[valid] += offset
+                offset = int(ids[valid].max()) + 1
+            ids_list.append(ids)
+        return np.concatenate(ids_list, 0) if ids_list else np.zeros((0, 1), dtype=np.float32)
 
 
 class MixUp(BaseMixTransform):
@@ -184,8 +217,10 @@ class MixUp(BaseMixTransform):
 
     def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         labels2 = labels["mix_labels"][0]
+        person_id = concat_person_ids(labels, labels2)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        labels["person_id"] = person_id
         return labels
 
 
@@ -250,6 +285,7 @@ class CutMix(BaseMixTransform):
         w, h = params["w"], params["h"]
         x1, y1, x2, y2 = params["area"].astype(np.int32)
         indexes2 = params["indexes2"]
+        person_id = concat_person_ids(labels, labels2, indexes2)
         instances2 = labels2["instances"][indexes2]
         instances2.convert_bbox("xyxy")
         instances2.denormalize(w, h)
@@ -258,7 +294,131 @@ class CutMix(BaseMixTransform):
         instances2.add_padding(x1, y1)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"][indexes2]], axis=0)
         labels["instances"] = Instances.concatenate([labels["instances"], instances2], axis=0)
+        labels["person_id"] = person_id
         return labels
+
+
+class OverlapPaste(BaseMixTransform):
+    """Paste one labeled person/group near another with a small controlled overlap."""
+
+    def __init__(
+        self,
+        dataset,
+        pre_transform=None,
+        p: float = 0.0,
+        overlap_range: tuple[float, float] = (0.04, 0.16),
+    ):
+        super().__init__(dataset=dataset, pre_transform=pre_transform, p=p)
+        self.overlap_range = overlap_range
+
+    def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
+        params = super().get_params(labels)
+        labels2 = labels["mix_labels"][0]
+        src_group = self._select_group(labels2)
+        dst_group = self._select_group(labels)
+        if src_group is None or dst_group is None:
+            params["skip"] = True
+            return params
+        params.update({"src_group": src_group, "dst_group": dst_group})
+        return params
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if params.get("skip"):
+            return labels
+        labels2 = labels["mix_labels"][0]
+        src_box = self._group_box(labels2, params["src_group"])
+        dst_box = self._group_box(labels, params["dst_group"])
+        if src_box is None or dst_box is None:
+            params["skip"] = True
+            return labels
+
+        h, w = labels["img"].shape[:2]
+        x1, y1, x2, y2 = src_box.astype(np.int32)
+        if x2 <= x1 or y2 <= y1:
+            params["skip"] = True
+            return labels
+
+        crop = labels2["img"][y1:y2, x1:x2]
+        ch, cw = crop.shape[:2]
+        overlap = random.uniform(*self.overlap_range)
+        side = random.choice(("left", "right", "top", "bottom"))
+        dx1, dy1, dx2, dy2 = dst_box
+        if side == "left":
+            px = int(round(dx1 - cw * (1.0 - overlap)))
+            py = int(round((dy1 + dy2 - ch) / 2))
+        elif side == "right":
+            px = int(round(dx2 - cw * overlap))
+            py = int(round((dy1 + dy2 - ch) / 2))
+        elif side == "top":
+            px = int(round((dx1 + dx2 - cw) / 2))
+            py = int(round(dy1 - ch * (1.0 - overlap)))
+        else:
+            px = int(round((dx1 + dx2 - cw) / 2))
+            py = int(round(dy2 - ch * overlap))
+
+        px = int(np.clip(px, 0, max(w - cw, 0)))
+        py = int(np.clip(py, 0, max(h - ch, 0)))
+        labels["img"][py : py + ch, px : px + cw] = crop
+        params.update({"src_box": src_box, "paste_xy": (px, py), "paste_shape": (cw, ch)})
+        return labels
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if params.get("skip"):
+            return labels
+        labels2 = labels["mix_labels"][0]
+        indexes = params["src_group"]
+        src_box = params["src_box"]
+        px, py = params["paste_xy"]
+
+        instances2 = labels2["instances"][indexes]
+        instances2.convert_bbox("xyxy")
+        b = instances2.bboxes.copy()
+        b[:, [0, 2]] += px - src_box[0]
+        b[:, [1, 3]] += py - src_box[1]
+        pasted = Instances(b, bbox_format="xyxy", normalized=False)
+        pasted.clip(labels["img"].shape[1], labels["img"].shape[0])
+        good = pasted.remove_zero_area_boxes()
+        if not good.any():
+            return labels
+
+        cls2 = labels2["cls"][indexes][good]
+        pid2 = _person_ids(labels2, indexes)[good]
+        labels["instances"] = Instances.concatenate([labels["instances"], pasted], axis=0)
+        labels["cls"] = np.concatenate([labels["cls"], cls2], axis=0)
+        labels["person_id"] = self._append_offset_person_ids(labels, pid2)
+        return labels
+
+    @staticmethod
+    def _select_group(labels: dict[str, Any]) -> np.ndarray | None:
+        if len(labels["cls"]) == 0:
+            return None
+        ids = _person_ids(labels).reshape(-1)
+        valid_ids = [pid for pid in np.unique(ids) if pid >= 0]
+        if valid_ids:
+            pid = random.choice(valid_ids)
+            return np.nonzero(ids == pid)[0]
+        return np.array([random.randrange(len(labels["cls"]))], dtype=int)
+
+    @staticmethod
+    def _group_box(labels: dict[str, Any], indexes: np.ndarray) -> np.ndarray | None:
+        if len(indexes) == 0:
+            return None
+        instances = labels["instances"][indexes]
+        instances.convert_bbox("xyxy")
+        b = instances.bboxes
+        x1, y1 = b[:, 0].min(), b[:, 1].min()
+        x2, y2 = b[:, 2].max(), b[:, 3].max()
+        return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+    @staticmethod
+    def _append_offset_person_ids(labels: dict[str, Any], pid2: np.ndarray) -> np.ndarray:
+        ids1 = _person_ids(labels)
+        ids2 = pid2.copy()
+        valid1 = ids1 >= 0
+        valid2 = ids2 >= 0
+        if valid1.any() and valid2.any():
+            ids2[valid2] += int(ids1[valid1].max()) + 1
+        return np.concatenate([ids1, ids2], axis=0)
 
 
 class RandomPerspective(BaseTransform):
@@ -316,6 +476,7 @@ class RandomPerspective(BaseTransform):
 
     def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         cls = labels["cls"]
+        person_id = labels.get("person_id", np.full((len(cls), 1), -1, dtype=np.float32))
         instances = labels.pop("instances")
         instances.convert_bbox(format="xyxy")
         instances.denormalize(*params["orig_shape"][::-1])
@@ -327,6 +488,7 @@ class RandomPerspective(BaseTransform):
         i = self.box_candidates(instances.bboxes.T, new_instances.bboxes.T)
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        labels["person_id"] = person_id[i]
         return labels
 
     def apply_bboxes(self, bboxes: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -475,11 +637,19 @@ class Format(BaseTransform):
         img = labels.get("img")
         h, w = img.shape[:2] if img is not None else (0, 0)
         cls = labels.pop("cls", np.array([]))
+        person_id = labels.pop("person_id", np.full((len(cls), 1), -1, dtype=np.float32))
         instances = labels.pop("instances", None)
         if instances is not None:
             instances.convert_bbox(format=self.bbox_format)
             instances.denormalize(w, h)
-        return {"h": h, "w": w, "cls": cls, "instances": instances, "nl": len(instances) if instances else 0}
+        return {
+            "h": h,
+            "w": w,
+            "cls": cls,
+            "person_id": person_id,
+            "instances": instances,
+            "nl": len(instances) if instances else 0,
+        }
 
     def apply_image(self, labels, params=None):
         img = labels.pop("img", None)
@@ -494,10 +664,12 @@ class Format(BaseTransform):
 
     def apply_instances(self, labels, params=None):
         cls = params["cls"]
+        person_id = params["person_id"]
         instances = params["instances"]
         nl = params["nl"]
         w, h = params["w"], params["h"]
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros((0, 1))
+        labels["person_id"] = torch.from_numpy(person_id) if nl else torch.full((0, 1), -1.0)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((0, 4))
         if self.normalize and nl:
             labels["bboxes"][:, [0, 2]] /= w
@@ -523,6 +695,7 @@ def v8_transforms(dataset, imgsz: int, hyp: TrainHyp) -> Compose:
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
+            OverlapPaste(dataset, pre_transform=pre_transform, p=hyp.overlap_paste),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud),
             RandomFlip(direction="horizontal", p=hyp.fliplr),
