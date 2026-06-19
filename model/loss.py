@@ -74,10 +74,11 @@ class BboxLoss(nn.Module):
 
 
 class AssociationLoss(nn.Module):
-    def __init__(self, face_cls: int = 0, person_cls: int = 1) -> None:
+    def __init__(self, face_cls: int = 0, person_cls: int = 1, hand_cls: int = -1) -> None:
         super().__init__()
         self.face_cls = face_cls
         self.person_cls = person_cls
+        self.hand_cls = hand_cls
 
     def forward(
         self,
@@ -106,7 +107,10 @@ class AssociationLoss(nn.Module):
                 if pid < 0:
                     continue
                 label = int(target_labels[bi, gi_long])
-                if label not in {self.face_cls, self.person_cls}:
+                part_classes = {self.face_cls}
+                if self.hand_cls >= 0:
+                    part_classes.add(self.hand_cls)
+                if label not in part_classes | {self.person_cls}:
                     continue
                 obj_embeds.append(F.normalize(emb[gt_idx == gi].mean(0), dim=0))
                 obj_boxes.append(gt_bboxes[bi, gi_long])
@@ -120,17 +124,19 @@ class AssociationLoss(nn.Module):
             boxes = torch.stack(obj_boxes).to(obj.device)
             labels = torch.tensor(obj_labels, device=obj.device)
             pids = torch.tensor(obj_pids, device=obj.device)
-            face_mask = labels == self.face_cls
+            part_mask = labels == self.face_cls
+            if self.hand_cls >= 0:
+                part_mask = part_mask | (labels == self.hand_cls)
             person_mask = labels == self.person_cls
-            if not face_mask.any() or not person_mask.any():
+            if not part_mask.any() or not person_mask.any():
                 continue
             logits = pair_scorer(
-                obj[face_mask],
+                obj[part_mask],
                 obj[person_mask],
-                boxes[face_mask],
+                boxes[part_mask],
                 boxes[person_mask],
             )
-            targets = (pids[face_mask, None] == pids[None, person_mask]).to(logits.dtype)
+            targets = (pids[part_mask, None] == pids[None, person_mask]).to(logits.dtype)
             loss_terms.append(F.binary_cross_entropy_with_logits(logits, targets))
         if not loss_terms:
             return pred_embeds.sum() * 0.0
@@ -163,6 +169,7 @@ class v8DetectionLoss:
         self.assoc_loss = AssociationLoss(
             face_cls=int(getattr(h, "face_cls", 0)),
             person_cls=int(getattr(h, "person_cls", 1)),
+            hand_cls=int(getattr(h, "hand_cls", -1)),
         ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Video inference with person tracking and passive face tracking.
+"""Video inference with person tracking and passive part tracking.
 
 Runs the YOLO model on small frame batches. Persons are tracked by ByteTrack;
-faces inherit the track id and color of the matched person from the face-person
+faces/hands inherit the track id and color of the matched person from the part-person
 pair scorer.
 """
 
@@ -437,7 +437,11 @@ def _empty(device: torch.device) -> torch.Tensor:
     return torch.zeros(0, 4, device=device)
 
 
-def match_faces_to_tracks(
+def _part_capacity(kind: str) -> int:
+    return 2 if kind in {"hand", "left_hand", "right_hand"} else 1
+
+
+def match_parts_to_tracks(
     model: torch.nn.Module,
     boxes: torch.Tensor,
     scores: torch.Tensor,
@@ -449,13 +453,13 @@ def match_faces_to_tracks(
 ) -> tuple[list[int], torch.Tensor]:
     kinds = [names[int(c)].lower() if 0 <= int(c) < len(names) else str(int(c)) for c in cls_ids.cpu().tolist()]
     person_mask = torch.tensor([k in {"person", "body"} for k in kinds], dtype=torch.bool)
-    face_mask = torch.tensor([k in {"face", "head"} for k in kinds], dtype=torch.bool)
+    part_mask = torch.tensor([k in {"face", "head", "hand", "left_hand", "right_hand"} for k in kinds], dtype=torch.bool)
     out_ids = [-1] * int(boxes.shape[0])
     person_indices = torch.nonzero(person_mask).flatten().tolist()
-    face_indices = torch.nonzero(face_mask).flatten().tolist()
+    part_indices = torch.nonzero(part_mask).flatten().tolist()
     for det_idx in person_indices:
         out_ids[det_idx] = person_track_ids[det_idx] if det_idx < len(person_track_ids) else -1
-    if not face_indices or not person_indices:
+    if not part_indices or not person_indices:
         return out_ids, person_mask
     pair_scorer = None
     head = model.model[-1] if hasattr(model, "model") else None
@@ -466,31 +470,32 @@ def match_faces_to_tracks(
         scorer_param = next(scorer_owner.parameters()) if scorer_owner is not None else None
         scorer_device = scorer_param.device if scorer_param is not None else embeds.device
         scorer_dtype = scorer_param.dtype if scorer_param is not None else embeds.dtype
-        face_t = torch.tensor(face_indices, dtype=torch.long)
+        part_t = torch.tensor(part_indices, dtype=torch.long)
         person_t = torch.tensor(person_indices, dtype=torch.long)
         pair_probs = pair_scorer(
-            embeds[face_t].to(device=scorer_device, dtype=scorer_dtype),
+            embeds[part_t].to(device=scorer_device, dtype=scorer_dtype),
             embeds[person_t].to(device=scorer_device, dtype=scorer_dtype),
-            boxes[face_t].to(device=scorer_device, dtype=scorer_dtype),
+            boxes[part_t].to(device=scorer_device, dtype=scorer_dtype),
             boxes[person_t].to(device=scorer_device, dtype=scorer_dtype),
         ).sigmoid().cpu()
         triples = [(float(pair_probs[fi, pi]), fi, pi) for fi in range(pair_probs.shape[0]) for pi in range(pair_probs.shape[1])]
     else:
-        ious = box_iou(boxes[face_indices].cpu(), boxes[person_indices].cpu())
+        ious = box_iou(boxes[part_indices].cpu(), boxes[person_indices].cpu())
         triples = [(float(ious[fi, pi]), fi, pi) for fi in range(ious.shape[0]) for pi in range(ious.shape[1])]
-    used_faces: set[int] = set()
-    used_people: set[int] = set()
+    used_parts: set[int] = set()
+    person_counts = [0] * len(person_indices)
     for score, fi, pi in sorted(triples, reverse=True):
-        if score < assoc_thres or fi in used_faces or pi in used_people:
+        kind = kinds[part_indices[fi]]
+        if score < assoc_thres or fi in used_parts or person_counts[pi] >= _part_capacity(kind):
             continue
         person_det_idx = person_indices[pi]
-        out_ids[face_indices[fi]] = person_track_ids[person_det_idx] if person_det_idx < len(person_track_ids) else -1
-        used_faces.add(fi)
-        used_people.add(pi)
+        out_ids[part_indices[fi]] = person_track_ids[person_det_idx] if person_det_idx < len(person_track_ids) else -1
+        used_parts.add(fi)
+        person_counts[pi] += 1
     return out_ids, person_mask
 
 
-def inherit_unmatched_faces_from_tracks(
+def inherit_unmatched_parts_from_tracks(
     track_ids: list[int],
     boxes: torch.Tensor,
     cls_ids: torch.Tensor,
@@ -500,30 +505,33 @@ def inherit_unmatched_faces_from_tracks(
     if not tracks or boxes.numel() == 0:
         return track_ids
     kinds = [names[int(c)].lower() if 0 <= int(c) < len(names) else str(int(c)) for c in cls_ids.detach().cpu().tolist()]
-    face_indices = [i for i, k in enumerate(kinds) if k in {"face", "head"} and track_ids[i] < 0]
-    if not face_indices:
+    part_indices = [i for i, k in enumerate(kinds) if k in {"face", "head", "hand", "left_hand", "right_hand"} and track_ids[i] < 0]
+    if not part_indices:
         return track_ids
     track_boxes = torch.tensor(np.stack([t.tlbr for t in tracks]), dtype=torch.float32)
-    face_boxes = boxes[face_indices].detach().cpu()
-    face_centers = (face_boxes[:, :2] + face_boxes[:, 2:]) / 2
+    part_boxes = boxes[part_indices].detach().cpu()
+    part_centers = (part_boxes[:, :2] + part_boxes[:, 2:]) / 2
     tb = track_boxes
     tw = (tb[:, 2] - tb[:, 0]).clamp(min=1)
     th = (tb[:, 3] - tb[:, 1]).clamp(min=1)
-    expanded = torch.stack((tb[:, 0] - 0.15 * tw, tb[:, 1] - 0.10 * th, tb[:, 2] + 0.15 * tw, tb[:, 3] + 0.10 * th), dim=1)
-    used_tracks: set[int] = set()
+    expanded = torch.stack((tb[:, 0] - 0.25 * tw, tb[:, 1] - 0.15 * th, tb[:, 2] + 0.25 * tw, tb[:, 3] + 0.25 * th), dim=1)
+    track_counts = [0] * len(tracks)
     candidates = []
-    for fi, center in enumerate(face_centers):
+    for fi, center in enumerate(part_centers):
         inside = (center[0] >= expanded[:, 0]) & (center[1] >= expanded[:, 1]) & (center[0] <= expanded[:, 2]) & (center[1] <= expanded[:, 3])
         for ti in torch.nonzero(inside).flatten().tolist():
             tx1, ty1, tx2, ty2 = tb[ti].tolist()
-            tc = torch.tensor([(tx1 + tx2) / 2, ty1 + (ty2 - ty1) * 0.18])
+            kind = kinds[part_indices[fi]]
+            y_ratio = 0.18 if kind in {"face", "head"} else 0.55
+            tc = torch.tensor([(tx1 + tx2) / 2, ty1 + (ty2 - ty1) * y_ratio])
             dist = float(torch.linalg.vector_norm(center - tc) / max((tw[ti] ** 2 + th[ti] ** 2).sqrt().item(), 1.0))
             candidates.append((dist, fi, ti))
     for _dist, fi, ti in sorted(candidates):
-        if ti in used_tracks:
+        kind = kinds[part_indices[fi]]
+        if track_counts[ti] >= _part_capacity(kind):
             continue
-        track_ids[face_indices[fi]] = tracks[ti].track_id
-        used_tracks.add(ti)
+        track_ids[part_indices[fi]] = tracks[ti].track_id
+        track_counts[ti] += 1
     return track_ids
 
 
@@ -678,10 +686,10 @@ def main() -> None:
                 person_track_ids = assign_person_tracks_to_visible(
                     vis_boxes, vis_cls, names, person_tracks, args.track_assign_iou
                 )
-                track_ids, person_mask = match_faces_to_tracks(
+                track_ids, person_mask = match_parts_to_tracks(
                     model, vis_boxes, vis_scores, vis_cls, vis_embeds, names, person_track_ids, args.assoc_thres
                 )
-                track_ids = inherit_unmatched_faces_from_tracks(track_ids, vis_boxes, vis_cls, names, person_tracks)
+                track_ids = inherit_unmatched_parts_from_tracks(track_ids, vis_boxes, vis_cls, names, person_tracks)
                 vis = draw_tracks(frame, vis_boxes, vis_scores, vis_cls, names, track_ids, person_mask, args.box_width)
                 writer.write(vis)
                 frame_idx += 1

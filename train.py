@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         "--keep-names",
         type=str,
         default="face,person",
-        help="训练时保留并重映射的类别名，默认 face,person；传空字符串表示保留 data.yaml 全部类别",
+        help="训练时保留并重映射的类别名；face,person 为无手，hand,face,person 为有手，传空字符串表示保留全部类别",
     )
     p.add_argument("--scale", type=str, default="n", choices=tuple(_SCALE_CLS))
     p.add_argument("--imgsz", type=int, default=640)
@@ -366,9 +366,10 @@ def main() -> None:
     names: list[str] = list(data["names"])
     lower_names = [name.lower() for name in names]
     if "face" not in lower_names or "person" not in lower_names:
-        raise ValueError(f"face-person association requires names containing face and person, got {names}")
+        raise ValueError(f"part-person association requires names containing face and person, got {names}")
     hyp.face_cls = lower_names.index("face")
     hyp.person_cls = lower_names.index("person")
+    hyp.hand_cls = lower_names.index("hand") if "hand" in lower_names else -1
     out_dir = Path(args.project) / args.name
     sample_dir = out_dir / "samples"
     weights_dir = out_dir / "weights"
@@ -380,7 +381,7 @@ def main() -> None:
     if keep_names != source_names:
         print(f"class filter/remap: {source_names} -> {names}")
     print(f"nc={data['nc']}  names={names}")
-    print(f"assoc pair classes: face={hyp.face_cls} person={hyp.person_cls}")
+    print(f"assoc pair classes: face={hyp.face_cls} hand={hyp.hand_cls} person={hyp.person_cls}")
 
     n_preview = min(args.preview_batches, len(train_loader))
     train_iter = iter(train_loader)

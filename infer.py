@@ -311,11 +311,17 @@ def _assoc_kind(cls_id: int, names: tuple[str, ...]) -> str:
         return "person"
     if name in {"face", "head"}:
         return "face"
+    if name in {"hand", "left_hand", "right_hand"}:
+        return "hand"
     return "other"
 
 
 def _kind_exclusive(kind: str) -> bool:
     return kind in {"person", "face"}
+
+
+def _part_capacity(kind: str) -> int:
+    return 2 if kind == "hand" else 1
 
 
 def _center(box: torch.Tensor) -> torch.Tensor:
@@ -347,7 +353,7 @@ def assign_person_ids(
 ) -> list[int]:
     """为每个框分配 person id。
 
-    哲学：person 检测各自作为一个组的种子；face 只有在几何 + embedding
+    哲学：person 检测各自作为一个组的种子；face/hand 只有在几何 + embedding
     都与某个 person 兼容时才挂到该组，否则保持 ``-1``（不属于任何人 ->
     推理时画成灰色）。这样 “看起来不属于任何人的部位” 就不管。
     """
@@ -372,51 +378,52 @@ def assign_person_ids(
     if not person_indices:
         return pids
 
-    face_indices = [i for i in order if kinds[i] == "face"]
-    if not face_indices:
+    part_indices = [i for i in order if kinds[i] in {"face", "hand"}]
+    if not part_indices:
         return pids
 
     if emb is not None and pair_scorer is not None:
-        face_t = torch.tensor(face_indices, dtype=torch.long)
+        part_t = torch.tensor(part_indices, dtype=torch.long)
         person_t = torch.tensor(person_indices, dtype=torch.long)
         scorer_owner = getattr(pair_scorer, "__self__", None)
         scorer_device = next(scorer_owner.parameters()).device if scorer_owner is not None else emb.device
         with torch.no_grad():
             pair_probs = pair_scorer(
-                emb[face_t].to(scorer_device),
+                emb[part_t].to(scorer_device),
                 emb[person_t].to(scorer_device),
-                boxes_c[face_t].to(scorer_device),
+                boxes_c[part_t].to(scorer_device),
                 boxes_c[person_t].to(scorer_device),
             ).sigmoid().cpu()
         triples = []
         for fi in range(pair_probs.shape[0]):
             for pi in range(pair_probs.shape[1]):
                 triples.append((float(pair_probs[fi, pi]), fi, pi))
-        used_faces: set[int] = set()
-        used_people: set[int] = set()
+        used_parts: set[int] = set()
+        person_counts = [0] * len(person_indices)
         for prob, fi, pi in sorted(triples, reverse=True):
-            if prob < assoc_thres or fi in used_faces or pi in used_people:
+            kind = kinds[part_indices[fi]]
+            if prob < assoc_thres or fi in used_parts or person_counts[pi] >= _part_capacity(kind):
                 continue
-            pids[face_indices[fi]] = pids[person_indices[pi]]
-            used_faces.add(fi)
-            used_people.add(pi)
+            pids[part_indices[fi]] = pids[person_indices[pi]]
+            used_parts.add(fi)
+            person_counts[pi] += 1
         return pids
 
     # 2) fallback：没有 pair scorer 时，仅用几何兼容性做一对一分配
-    used_people: set[int] = set()
-    for i in face_indices:
+    person_counts = [0] * len(person_indices)
+    for i in part_indices:
         best_j, best_sim = -1, -1.0
         for j, person_idx in enumerate(person_indices):
-            if j in used_people:
+            if person_counts[j] >= _part_capacity(kinds[i]):
                 continue
-            if not _geometry_compatible(boxes_c[i], "face", boxes_c[person_idx], "person"):
+            if not _geometry_compatible(boxes_c[i], kinds[i], boxes_c[person_idx], "person"):
                 continue
             sim = float(scores[i]) + float(scores[person_idx])
             if sim > best_sim:
                 best_j, best_sim = j, sim
         if best_j >= 0:
             pids[i] = pids[person_indices[best_j]]
-            used_people.add(best_j)
+            person_counts[best_j] += 1
     return pids
 
 

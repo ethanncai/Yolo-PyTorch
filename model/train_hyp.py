@@ -13,6 +13,7 @@ class ModelHyp:
     assoc: float = 0.1
     face_cls: int = 0
     person_cls: int = 1
+    hand_cls: int = -1
     lr0: float = 0.01
     lrf: float = 0.01
     momentum: float = 0.937
