@@ -56,6 +56,13 @@ class ByteTrackTrack:
     state: str = "tracked"
 
 
+@dataclass
+class FallbackVisibleTrack:
+    track_id: int
+    tlbr: np.ndarray
+    age: int = 0
+
+
 class ByteTracker:
     """Small self-contained ByteTrack implementation for person boxes.
 
@@ -249,6 +256,12 @@ def color_for_track(track_id: int) -> tuple[int, int, int]:
     return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
 
+def display_track_label(track_id: int) -> str:
+    if track_id >= 10_000:
+        return f"T{track_id - 10_000}*"
+    return f"T{track_id}"
+
+
 def draw_label(frame: np.ndarray, x: int, y: int, text: str, color: tuple[int, int, int]) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.55
@@ -325,7 +338,7 @@ def draw_tracks(
             cx = int(round((x1 + x2) / 2))
             cy = int(round((y1 + y2) / 2))
             cv2.circle(out, (cx, cy), 3, color, -1)
-        tag = f"T{track_id} {name} {score:.2f}" if track_id >= 0 else f"unmatched {name} {score:.2f}"
+        tag = f"{display_track_label(track_id)} {name} {score:.2f}" if track_id >= 0 else f"unmatched {name} {score:.2f}"
         draw_label(out, x1i + 2, y1i - 2, tag, color)
     return out
 
@@ -344,6 +357,7 @@ def detect_frame(
     names: tuple[str, ...],
     keep_names: tuple[str, ...] | None,
     min_conf: float | None = None,
+    face_conf_thres: float | None = 0.56,
     half: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     return detect_frames(
@@ -358,8 +372,30 @@ def detect_frame(
         names=names,
         keep_names=keep_names,
         min_conf=min_conf,
+        face_conf_thres=face_conf_thres,
         half=half,
     )[0]
+
+
+def _face_threshold_mask(
+    conf: torch.Tensor,
+    cls_id: torch.Tensor,
+    names: tuple[str, ...],
+    base_conf: float,
+    face_conf: float | None,
+) -> torch.Tensor:
+    if face_conf is None:
+        return conf >= base_conf
+    face_cls = torch.tensor(
+        [i for i, name in enumerate(names) if name.lower() in {"face", "head"}],
+        device=cls_id.device,
+        dtype=cls_id.dtype,
+    )
+    thresholds = torch.full_like(conf, float(base_conf))
+    if face_cls.numel():
+        is_face = (cls_id[:, None] == face_cls[None, :]).any(1)
+        thresholds = torch.where(is_face, torch.full_like(conf, float(face_conf)), thresholds)
+    return conf >= thresholds
 
 
 @torch.no_grad()
@@ -376,6 +412,7 @@ def detect_frames(
     names: tuple[str, ...],
     keep_names: tuple[str, ...] | None,
     min_conf: float | None = None,
+    face_conf_thres: float | None = 0.56,
     half: bool = False,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
     if not frames_bgr:
@@ -409,7 +446,8 @@ def detect_frames(
         cls_scores = pred[:, 4:]
         conf, cls_id = cls_scores.max(dim=1)
         raw_embeds = raw_embeds_all[batch_idx].transpose(0, 1) if raw_embeds_all is not None else None
-        mask = conf >= (conf_thres if min_conf is None else min_conf)
+        base_conf = conf_thres if min_conf is None else min_conf
+        mask = _face_threshold_mask(conf, cls_id, names, base_conf, face_conf_thres)
         boxes_xywh, conf, cls_id = boxes_xywh[mask], conf[mask], cls_id[mask]
         embeds = raw_embeds[mask] if raw_embeds is not None else None
         if boxes_xywh.numel() == 0:
@@ -441,6 +479,53 @@ def _part_capacity(kind: str) -> int:
     return 2 if kind in {"hand", "left_hand", "right_hand"} else 1
 
 
+def _part_count_key(kind: str) -> str:
+    return "hand" if kind in {"hand", "left_hand", "right_hand"} else "face"
+
+
+def _box_center(box: torch.Tensor) -> torch.Tensor:
+    return (box[:2] + box[2:]) / 2
+
+
+def _part_person_geometry_score(part_box: torch.Tensor, kind: str, person_box: torch.Tensor) -> float:
+    px1, py1, px2, py2 = person_box.detach().cpu().float().tolist()
+    bw, bh = max(px2 - px1, 1.0), max(py2 - py1, 1.0)
+    cx, cy = _box_center(part_box.detach().cpu().float()).tolist()
+    x_rel = (cx - px1) / bw
+    y_rel = (cy - py1) / bh
+    if kind in {"face", "head"}:
+        if not (-0.15 <= x_rel <= 1.15 and -0.12 <= y_rel <= 0.48):
+            return -1.0
+        # Side views and bent poses often put the head away from box center, so
+        # use several plausible upper-body anchors instead of one top-center.
+        anchors = ((0.22, 0.18), (0.50, 0.18), (0.78, 0.18))
+        dist = min(((x_rel - ax) ** 2 + ((y_rel - ay) * 1.6) ** 2) ** 0.5 for ax, ay in anchors)
+        return max(0.0, 1.0 - dist * 1.8)
+    if kind in {"hand", "left_hand", "right_hand"}:
+        if not (-0.30 <= x_rel <= 1.30 and -0.10 <= y_rel <= 1.18):
+            return -1.0
+        anchors = ((0.12, 0.55), (0.88, 0.55), (0.25, 0.70), (0.75, 0.70))
+        dist = min(((x_rel - ax) ** 2 + ((y_rel - ay) * 1.2) ** 2) ** 0.5 for ax, ay in anchors)
+        return max(0.0, 1.0 - dist * 1.4)
+    return -1.0
+
+
+def _order_scores(boxes: torch.Tensor, part_indices: list[int], person_indices: list[int]) -> dict[tuple[int, int], float]:
+    if len(part_indices) <= 1 or len(person_indices) <= 1:
+        return {}
+    boxes_cpu = boxes.detach().cpu()
+    centers_x = (boxes_cpu[:, 0] + boxes_cpu[:, 2]) / 2
+    part_rank = {idx: rank for rank, idx in enumerate(sorted(part_indices, key=lambda i: float(centers_x[i])))}
+    person_rank = {idx: rank for rank, idx in enumerate(sorted(person_indices, key=lambda i: float(centers_x[i])))}
+    part_den = max(len(part_indices) - 1, 1)
+    person_den = max(len(person_indices) - 1, 1)
+    return {
+        (part_idx, person_idx): 1.0 - abs(part_rank[part_idx] / part_den - person_rank[person_idx] / person_den)
+        for part_idx in part_indices
+        for person_idx in person_indices
+    }
+
+
 def match_parts_to_tracks(
     model: torch.nn.Module,
     boxes: torch.Tensor,
@@ -461,6 +546,7 @@ def match_parts_to_tracks(
         out_ids[det_idx] = person_track_ids[det_idx] if det_idx < len(person_track_ids) else -1
     if not part_indices or not person_indices:
         return out_ids, person_mask
+    order_scores = _order_scores(boxes, part_indices, person_indices)
     pair_scorer = None
     head = model.model[-1] if hasattr(model, "model") else None
     if getattr(head, "pair_scorer_trained", True):
@@ -478,20 +564,37 @@ def match_parts_to_tracks(
             boxes[part_t].to(device=scorer_device, dtype=scorer_dtype),
             boxes[person_t].to(device=scorer_device, dtype=scorer_dtype),
         ).sigmoid().cpu()
-        triples = [(float(pair_probs[fi, pi]), fi, pi) for fi in range(pair_probs.shape[0]) for pi in range(pair_probs.shape[1])]
+        triples = []
+        for fi in range(pair_probs.shape[0]):
+            for pi in range(pair_probs.shape[1]):
+                part_idx = part_indices[fi]
+                person_idx = person_indices[pi]
+                geom = _part_person_geometry_score(boxes[part_idx], kinds[part_idx], boxes[person_idx])
+                if geom < 0.0:
+                    continue
+                order = order_scores.get((part_idx, person_idx), 1.0)
+                score = 0.62 * float(pair_probs[fi, pi]) + 0.28 * geom + 0.10 * order
+                triples.append((score, fi, pi))
     else:
-        ious = box_iou(boxes[part_indices].cpu(), boxes[person_indices].cpu())
-        triples = [(float(ious[fi, pi]), fi, pi) for fi in range(ious.shape[0]) for pi in range(ious.shape[1])]
+        triples = []
+        for fi, part_idx in enumerate(part_indices):
+            for pi, person_idx in enumerate(person_indices):
+                geom = _part_person_geometry_score(boxes[part_idx], kinds[part_idx], boxes[person_idx])
+                if geom < 0.0:
+                    continue
+                order = order_scores.get((part_idx, person_idx), 1.0)
+                triples.append((0.82 * geom + 0.18 * order, fi, pi))
     used_parts: set[int] = set()
-    person_counts = [0] * len(person_indices)
+    person_counts: dict[tuple[int, str], int] = {}
     for score, fi, pi in sorted(triples, reverse=True):
         kind = kinds[part_indices[fi]]
-        if score < assoc_thres or fi in used_parts or person_counts[pi] >= _part_capacity(kind):
+        count_key = _part_count_key(kind)
+        if score < assoc_thres or fi in used_parts or person_counts.get((pi, count_key), 0) >= _part_capacity(kind):
             continue
         person_det_idx = person_indices[pi]
         out_ids[part_indices[fi]] = person_track_ids[person_det_idx] if person_det_idx < len(person_track_ids) else -1
         used_parts.add(fi)
-        person_counts[pi] += 1
+        person_counts[(pi, count_key)] = person_counts.get((pi, count_key), 0) + 1
     return out_ids, person_mask
 
 
@@ -515,7 +618,17 @@ def inherit_unmatched_parts_from_tracks(
     tw = (tb[:, 2] - tb[:, 0]).clamp(min=1)
     th = (tb[:, 3] - tb[:, 1]).clamp(min=1)
     expanded = torch.stack((tb[:, 0] - 0.25 * tw, tb[:, 1] - 0.15 * th, tb[:, 2] + 0.25 * tw, tb[:, 3] + 0.25 * th), dim=1)
-    track_counts = [0] * len(tracks)
+    track_pos_by_id = {track.track_id: idx for idx, track in enumerate(tracks)}
+    track_counts: dict[tuple[int, str], int] = {}
+    for idx, track_id in enumerate(track_ids):
+        if track_id < 0 or idx in part_indices:
+            continue
+        track_pos = track_pos_by_id.get(track_id)
+        kind = kinds[idx]
+        if track_pos is None or kind not in {"face", "head", "hand", "left_hand", "right_hand"}:
+            continue
+        count_key = _part_count_key(kind)
+        track_counts[(track_pos, count_key)] = track_counts.get((track_pos, count_key), 0) + 1
     candidates = []
     for fi, center in enumerate(part_centers):
         inside = (center[0] >= expanded[:, 0]) & (center[1] >= expanded[:, 1]) & (center[0] <= expanded[:, 2]) & (center[1] <= expanded[:, 3])
@@ -528,10 +641,11 @@ def inherit_unmatched_parts_from_tracks(
             candidates.append((dist, fi, ti))
     for _dist, fi, ti in sorted(candidates):
         kind = kinds[part_indices[fi]]
-        if track_counts[ti] >= _part_capacity(kind):
+        count_key = _part_count_key(kind)
+        if track_counts.get((ti, count_key), 0) >= _part_capacity(kind):
             continue
         track_ids[part_indices[fi]] = tracks[ti].track_id
-        track_counts[ti] += 1
+        track_counts[(ti, count_key)] = track_counts.get((ti, count_key), 0) + 1
     return track_ids
 
 
@@ -580,6 +694,74 @@ def assign_person_tracks_to_visible(
     return ids
 
 
+def fill_visible_person_track_gaps(
+    ids: list[int],
+    visible_boxes: torch.Tensor,
+    visible_cls: torch.Tensor,
+    names: tuple[str, ...],
+    fallback_tracks: list[FallbackVisibleTrack],
+    next_fallback_id: int,
+    iou_thres: float,
+    max_age: int,
+) -> tuple[list[int], list[FallbackVisibleTrack], int]:
+    kinds = [names[int(c)].lower() if 0 <= int(c) < len(names) else str(int(c)) for c in visible_cls.detach().cpu().tolist()]
+    unmatched_persons = [i for i, k in enumerate(kinds) if k in {"person", "body"} and ids[i] < 0]
+    matched_persons = [i for i, k in enumerate(kinds) if k in {"person", "body"} and ids[i] >= 0]
+    if matched_persons and fallback_tracks:
+        matched_boxes = visible_boxes[matched_persons].detach().cpu()
+        keep_fallback = []
+        for track in fallback_tracks:
+            track_box = torch.tensor(track.tlbr, dtype=torch.float32).view(1, 4)
+            if float(box_iou(track_box, matched_boxes).max()) < iou_thres:
+                keep_fallback.append(track)
+        fallback_tracks = keep_fallback
+    if not unmatched_persons:
+        aged = []
+        for track in fallback_tracks:
+            track.age += 1
+            if track.age <= max_age:
+                aged.append(track)
+        return ids, aged, next_fallback_id
+
+    boxes_cpu = visible_boxes[unmatched_persons].detach().cpu()
+    used_dets: set[int] = set()
+    used_tracks: set[int] = set()
+    if fallback_tracks:
+        track_boxes = torch.tensor(np.stack([t.tlbr for t in fallback_tracks]), dtype=torch.float32)
+        ious = box_iou(boxes_cpu, track_boxes)
+        triples = [(float(ious[di, ti]), di, ti) for di in range(ious.shape[0]) for ti in range(ious.shape[1])]
+        for iou, det_pos, track_pos in sorted(triples, reverse=True):
+            if iou < iou_thres or det_pos in used_dets or track_pos in used_tracks:
+                continue
+            det_idx = unmatched_persons[det_pos]
+            track = fallback_tracks[track_pos]
+            track.tlbr = boxes_cpu[det_pos].numpy().astype(np.float32)
+            track.age = 0
+            ids[det_idx] = track.track_id
+            used_dets.add(det_pos)
+            used_tracks.add(track_pos)
+
+    for det_pos, det_idx in enumerate(unmatched_persons):
+        if det_pos in used_dets:
+            continue
+        track = FallbackVisibleTrack(
+            track_id=next_fallback_id,
+            tlbr=boxes_cpu[det_pos].numpy().astype(np.float32),
+        )
+        next_fallback_id += 1
+        fallback_tracks.append(track)
+        ids[det_idx] = track.track_id
+        used_tracks.add(len(fallback_tracks) - 1)
+
+    aged = []
+    for idx, track in enumerate(fallback_tracks):
+        if idx not in used_tracks:
+            track.age += 1
+        if track.age <= max_age:
+            aged.append(track)
+    return ids, aged, next_fallback_id
+
+
 def open_writer(path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
     path.parent.mkdir(parents=True, exist_ok=True)
     suffix = path.suffix.lower()
@@ -597,6 +779,7 @@ def main() -> None:
     ap.add_argument("-o", "--output", type=Path, default=None, help="output video path")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--face-conf", type=float, default=0.56, help="face/head class confidence threshold")
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--assoc-thres", type=float, default=0.45)
     ap.add_argument("--track-low-conf", type=float, default=0.1, help="minimum person confidence fed to ByteTrack")
@@ -654,6 +837,8 @@ def main() -> None:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frame_idx = 0
     t0 = time.perf_counter()
+    fallback_tracks: list[FallbackVisibleTrack] = []
+    next_fallback_id = 10_000
     try:
         while True:
             frames: list[np.ndarray] = []
@@ -676,6 +861,7 @@ def main() -> None:
                 max_nms_candidates=args.max_nms_candidates,
                 names=names,
                 keep_names=keep_names,
+                face_conf_thres=args.face_conf,
                 half=use_half,
             )
             for frame, (boxes, scores, cls_ids, embeds) in zip(frames, detections):
@@ -685,6 +871,16 @@ def main() -> None:
                 person_tracks = tracker.update(person_boxes, person_scores, person_embeds)
                 person_track_ids = assign_person_tracks_to_visible(
                     vis_boxes, vis_cls, names, person_tracks, args.track_assign_iou
+                )
+                person_track_ids, fallback_tracks, next_fallback_id = fill_visible_person_track_gaps(
+                    person_track_ids,
+                    vis_boxes,
+                    vis_cls,
+                    names,
+                    fallback_tracks,
+                    next_fallback_id,
+                    args.track_assign_iou,
+                    args.track_buffer,
                 )
                 track_ids, person_mask = match_parts_to_tracks(
                     model, vis_boxes, vis_scores, vis_cls, vis_embeds, names, person_track_ids, args.assoc_thres

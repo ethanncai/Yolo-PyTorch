@@ -284,6 +284,52 @@ def object_kind(obj: YoloObject, names: list[str], person_names: set[str], face_
     return "other"
 
 
+def find_class_index(names: list[str], candidates: set[str], kind: str) -> int:
+    lower_names = [name.lower() for name in names]
+    for idx, name in enumerate(lower_names):
+        if name in candidates:
+            return idx
+    raise ValueError(f"data.yaml names must contain a {kind} class from {sorted(candidates)}, got {names}")
+
+
+def yolo_object_from_pose_person(pose: PosePerson, person_cls: int, person_id: int) -> YoloObject | None:
+    x1, y1, x2, y2 = pose.xyxy
+    x1, y1 = max(0.0, min(1.0, x1)), max(0.0, min(1.0, y1))
+    x2, y2 = max(0.0, min(1.0, x2)), max(0.0, min(1.0, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return YoloObject(
+        cls=person_cls,
+        x=(x1 + x2) / 2,
+        y=(y1 + y2) / 2,
+        w=x2 - x1,
+        h=y2 - y1,
+        person_id=person_id,
+    )
+
+
+def replace_person_boxes_with_pose(
+    objects: list[YoloObject],
+    names: list[str],
+    person_names: set[str],
+    face_names: set[str],
+    hand_names: set[str],
+    pose_people: list[PosePerson],
+    person_cls: int,
+) -> tuple[list[YoloObject], int, int]:
+    kept = [
+        obj
+        for obj in objects
+        if object_kind(obj, names, person_names, face_names, hand_names) != "person"
+    ]
+    pose_objects = [
+        obj
+        for idx, pose in enumerate(pose_people)
+        if (obj := yolo_object_from_pose_person(pose, person_cls, idx)) is not None
+    ]
+    return kept + pose_objects, len(objects) - len(kept), len(pose_objects)
+
+
 def score_pose_object(obj: YoloObject, obj_kind: str, pose: PosePerson, kpt_conf: float) -> float:
     obj_box = obj.xyxy
     pose_box = pose.xyxy
@@ -595,6 +641,7 @@ def main() -> None:
     person_names = parse_name_set(args.person_names)
     face_names = parse_name_set(args.face_names)
     hand_names = parse_name_set(args.hand_names)
+    person_cls = find_class_index(names, person_names, "person")
     pose_model = load_pose_model(args.pose_weights)
 
     processed: list[tuple[Path, Path]] = []
@@ -605,6 +652,8 @@ def main() -> None:
     pose_hits = 0
     fallback_hits = 0
     skipped_images = 0
+    replaced_source_person_boxes = 0
+    added_pose_person_boxes = 0
 
     for split in ("train", "val", "test"):
         if not data.get(split):
@@ -630,6 +679,17 @@ def main() -> None:
                     device=args.device,
                     kpt_conf=args.pose_kpt_conf,
                 )
+                objects, n_replaced, n_added = replace_person_boxes_with_pose(
+                    objects,
+                    names,
+                    person_names,
+                    face_names,
+                    hand_names,
+                    pose_people,
+                    person_cls,
+                )
+                replaced_source_person_boxes += n_replaced
+                added_pose_person_boxes += n_added
                 used_pose = associate_objects_with_pose(
                     objects,
                     names,
@@ -674,6 +734,7 @@ def main() -> None:
 
     print(f"wrote dataset: {args.out.resolve()}")
     print(f"images={total_images} objects={total_objects} associated={total_associated}")
+    print(f"person_boxes: replaced_source={replaced_source_person_boxes} added_from_pose={added_pose_person_boxes}")
     print(f"pose_associated_images={pose_hits} fallback_images={fallback_hits} skipped_images={skipped_images}")
     print(f"viz={min(args.viz, len(processed)) if processed else 0} -> {args.out / 'viz'}")
 

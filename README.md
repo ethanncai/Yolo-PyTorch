@@ -62,6 +62,7 @@ python infer.py \
   --device cuda \
   --imgsz 640 \
   --conf 0.25 \
+  --face-conf 0.56 \
   --iou 0.45 \
   --assoc-thres 0.45 \
   --keep-names hand,face,person
@@ -80,6 +81,7 @@ python infer_video.py \
   --batch-size 4 \
   --imgsz 640 \
   --conf 0.25 \
+  --face-conf 0.56 \
   --iou 0.45 \
   --assoc-thres 0.45 \
   --keep-names hand,face,person \
@@ -101,6 +103,7 @@ python infer.py \
   --device cuda \
   --imgsz 640 \
   --conf 0.25 \
+  --face-conf 0.56 \
   --iou 0.45 \
   --assoc-thres 0.45 \
   --keep-names face,person
@@ -117,6 +120,7 @@ python infer_video.py \
   --batch-size 4 \
   --imgsz 640 \
   --conf 0.25 \
+  --face-conf 0.56 \
   --iou 0.45 \
   --assoc-thres 0.45 \
   --keep-names face,person \
@@ -132,6 +136,8 @@ python infer_video.py \
 
 Input: normal YOLO `hand,face,person` dataset with label rows `cls x y w h`.
 Output: association dataset with label rows `cls x y w h person_id`.
+The output `person` boxes are replaced by YOLO11 pose person boxes; source
+dataset `person` boxes are ignored because they are often noisy.
 
 ```bash
 python scripts/gen_association_dataset.py \

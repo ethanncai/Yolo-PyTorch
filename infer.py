@@ -316,12 +316,37 @@ def _assoc_kind(cls_id: int, names: tuple[str, ...]) -> str:
     return "other"
 
 
+def _face_threshold_mask(
+    conf: torch.Tensor,
+    cls_id: torch.Tensor,
+    names: tuple[str, ...],
+    base_conf: float,
+    face_conf: float | None,
+) -> torch.Tensor:
+    if face_conf is None:
+        return conf >= base_conf
+    face_cls = torch.tensor(
+        [i for i, name in enumerate(names) if name.lower() in {"face", "head"}],
+        device=cls_id.device,
+        dtype=cls_id.dtype,
+    )
+    thresholds = torch.full_like(conf, float(base_conf))
+    if face_cls.numel():
+        is_face = (cls_id[:, None] == face_cls[None, :]).any(1)
+        thresholds = torch.where(is_face, torch.full_like(conf, float(face_conf)), thresholds)
+    return conf >= thresholds
+
+
 def _kind_exclusive(kind: str) -> bool:
     return kind in {"person", "face"}
 
 
 def _part_capacity(kind: str) -> int:
     return 2 if kind == "hand" else 1
+
+
+def _part_count_key(kind: str) -> str:
+    return "hand" if kind == "hand" else "face"
 
 
 def _center(box: torch.Tensor) -> torch.Tensor:
@@ -399,22 +424,24 @@ def assign_person_ids(
             for pi in range(pair_probs.shape[1]):
                 triples.append((float(pair_probs[fi, pi]), fi, pi))
         used_parts: set[int] = set()
-        person_counts = [0] * len(person_indices)
+        person_counts: dict[tuple[int, str], int] = {}
         for prob, fi, pi in sorted(triples, reverse=True):
             kind = kinds[part_indices[fi]]
-            if prob < assoc_thres or fi in used_parts or person_counts[pi] >= _part_capacity(kind):
+            count_key = _part_count_key(kind)
+            if prob < assoc_thres or fi in used_parts or person_counts.get((pi, count_key), 0) >= _part_capacity(kind):
                 continue
             pids[part_indices[fi]] = pids[person_indices[pi]]
             used_parts.add(fi)
-            person_counts[pi] += 1
+            person_counts[(pi, count_key)] = person_counts.get((pi, count_key), 0) + 1
         return pids
 
     # 2) fallback：没有 pair scorer 时，仅用几何兼容性做一对一分配
-    person_counts = [0] * len(person_indices)
+    person_counts: dict[tuple[int, str], int] = {}
     for i in part_indices:
         best_j, best_sim = -1, -1.0
         for j, person_idx in enumerate(person_indices):
-            if person_counts[j] >= _part_capacity(kinds[i]):
+            count_key = _part_count_key(kinds[i])
+            if person_counts.get((j, count_key), 0) >= _part_capacity(kinds[i]):
                 continue
             if not _geometry_compatible(boxes_c[i], kinds[i], boxes_c[person_idx], "person"):
                 continue
@@ -423,7 +450,8 @@ def assign_person_ids(
                 best_j, best_sim = j, sim
         if best_j >= 0:
             pids[i] = pids[person_indices[best_j]]
-            person_counts[best_j] += 1
+            count_key = _part_count_key(kinds[i])
+            person_counts[(best_j, count_key)] = person_counts.get((best_j, count_key), 0) + 1
     return pids
 
 
@@ -441,6 +469,7 @@ def run_infer(
     assoc_thres: float = 0.45,
     box_width: int = 5,
     keep_names: tuple[str, ...] | None = ("face", "person"),
+    face_conf_thres: float | None = 0.56,
 ) -> tuple["Image.Image", int]:
     from PIL import Image
 
@@ -462,7 +491,11 @@ def run_infer(
         if isinstance(assoc_preds, dict) and "embeds" in assoc_preds:
             raw_embeds = assoc_preds["embeds"][0].transpose(0, 1)
     conf, cls_id = cls_scores.max(dim=1)
-    mask = conf >= conf_thres
+    nc = int(model.nc) if hasattr(model, "nc") else cls_scores.shape[-1]
+    if names is None:
+        names = COCO_NAMES[:nc] if nc <= len(COCO_NAMES) else tuple(f"c{i}" for i in range(nc))
+
+    mask = _face_threshold_mask(conf, cls_id, names, conf_thres, face_conf_thres)
     boxes_xywh = boxes_xywh[mask]
     conf = conf[mask]
     cls_id = cls_id[mask]
@@ -470,10 +503,6 @@ def run_infer(
 
     if boxes_xywh.numel() == 0:
         return pil.copy(), 0
-
-    nc = int(model.nc) if hasattr(model, "nc") else cls_scores.shape[-1]
-    if names is None:
-        names = COCO_NAMES[:nc] if nc <= len(COCO_NAMES) else tuple(f"c{i}" for i in range(nc))
 
     if keep_names:
         keep_set = {name.lower() for name in keep_names}
@@ -531,6 +560,7 @@ def main() -> None:
     ap.add_argument("-o", "--output", type=Path, default=None, help="保存路径（默认：<image_stem>_det.jpg）")
     ap.add_argument("--imgsz", type=int, default=640, help="letterbox 边长")
     ap.add_argument("--conf", type=float, default=0.25, help="置信度阈值")
+    ap.add_argument("--face-conf", type=float, default=0.56, help="face/head 类置信度阈值")
     ap.add_argument("--iou", type=float, default=0.45, help="NMS IoU 阈值")
     ap.add_argument("--device", type=str, default=None, help="cuda / cpu，默认自动")
     ap.add_argument("--max-det", type=int, default=300, help="每张图最多保留框数")
@@ -583,6 +613,7 @@ def main() -> None:
         assoc_thres=args.assoc_thres,
         box_width=args.box_width,
         keep_names=tuple(x.strip() for x in args.keep_names.split(",") if x.strip()) or None,
+        face_conf_thres=args.face_conf,
     )
     vis.save(out_path)
     print(f"saved {out_path} ({n} detections)")
